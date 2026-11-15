@@ -51,6 +51,7 @@ __all__ = [
     "get_product",
     "get_warehouse",
     "list_products",
+    "list_stock",
     "list_stock_movements",
     "list_warehouses",
     "update_product",
@@ -486,6 +487,32 @@ def create_stock_movement(
 
     db.refresh(movement)
     return movement
+
+
+def list_stock(
+    db: Session,
+    *,
+    skip: int = 0,
+    limit: int = 100,
+    product_id: int | None = None,
+    warehouse_id: int | None = None,
+) -> list[Stock]:
+    """Consulta los saldos actuales por producto y almacén.
+
+    Ordena por producto y almacén para que el frontend pueda construir la matriz
+    de existencias de forma determinista.
+    """
+    stmt = select(Stock)
+    if product_id is not None:
+        stmt = stmt.where(Stock.product_id == product_id)
+    if warehouse_id is not None:
+        stmt = stmt.where(Stock.warehouse_id == warehouse_id)
+    stmt = (
+        stmt.order_by(Stock.product_id, Stock.warehouse_id)
+        .offset(skip)
+        .limit(limit)
+    )
+    return list(db.scalars(stmt).all())
 
 
 def list_stock_movements(

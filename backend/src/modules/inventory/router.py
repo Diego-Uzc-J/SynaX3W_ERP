@@ -30,6 +30,7 @@ from src.modules.inventory.schemas import (
     ProductUpdate,
     StockMovementCreate,
     StockMovementResponse,
+    StockResponse,
     WarehouseCreate,
     WarehouseResponse,
     WarehouseUpdate,
@@ -262,6 +263,37 @@ def list_stock_movements(
 
 
 # --------------------------------------------------------------------------- #
+# Existencias — /api/v1/inventory/stock
+# --------------------------------------------------------------------------- #
+
+stock_router = APIRouter(prefix="/stock", tags=["inventory: stock"])
+
+
+@stock_router.get(
+    "",
+    response_model=list[StockResponse],
+    status_code=status.HTTP_200_OK,
+    summary="Consultar niveles de existencias",
+)
+def list_stock(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
+    product_id: int | None = Query(None, gt=0),
+    warehouse_id: int | None = Query(None, gt=0),
+    db: Session = Depends(get_db),
+) -> list[StockResponse]:
+    """Devuelve el saldo actual por producto y almacén."""
+    stock_levels = services.list_stock(
+        db,
+        skip=skip,
+        limit=limit,
+        product_id=product_id,
+        warehouse_id=warehouse_id,
+    )
+    return [StockResponse.model_validate(level) for level in stock_levels]
+
+
+# --------------------------------------------------------------------------- #
 # Router agregado
 # --------------------------------------------------------------------------- #
 
@@ -269,3 +301,4 @@ router = APIRouter()
 router.include_router(products_router)
 router.include_router(warehouses_router)
 router.include_router(movements_router)
+router.include_router(stock_router)

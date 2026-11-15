@@ -1,0 +1,83 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Archivo", ui-sans-serif, system-ui, sans-serif;
+
+  --color-ink-950: #141914;
+  --color-ink-900: #1c241d;
+  --color-ink-700: #35443a;
+  --color-ink-500: #556458;
+
+  --color-concrete-50: #f3f5ef;
+  --color-concrete-100: #e6eae1;
+  --color-concrete-200: #cfd6c9;
+  --color-concrete-400: #8b968a;
+
+  --color-signal-500: #d9481c;
+  --color-signal-600: #b93a13;
+  --color-signal-100: #fbe4d9;
+
+  --color-pine-600: #2e6b4f;
+  --color-pine-100: #dcebe1;
+
+  --color-clay-600: #a65b0b;
+  --color-clay-100: #f6e6cc;
+}
+
+@layer base {
+  html {
+    color-scheme: light;
+  }
+
+  body {
+    @apply bg-concrete-50 font-sans text-ink-950 antialiased;
+  }
+
+  ::selection {
+    background-color: var(--color-signal-100);
+    color: var(--color-ink-950);
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-signal-500);
+    outline-offset: 2px;
+  }
+}
+
+@keyframes sheet-in {
+  from {
+    transform: translateX(28px);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+@keyframes backdrop-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.sheet-enter {
+  animation: sheet-in 220ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
+.backdrop-enter {
+  animation: backdrop-in 160ms ease-out both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

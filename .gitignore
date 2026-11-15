@@ -5,3 +5,17 @@ specs/
 PROJECT_MANIFEST.md
 skills-lock.json
 MEMORY.md
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/*.local
+.env
+.env.*

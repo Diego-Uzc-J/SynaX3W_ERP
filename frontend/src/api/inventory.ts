@@ -15,15 +15,6 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 // Configuración y entorno
 // --------------------------------------------------------------------------- //
 
-declare global {
-  interface ImportMetaEnv {
-    readonly VITE_API_URL?: string;
-  }
-  interface ImportMeta {
-    readonly env: ImportMetaEnv;
-  }
-}
-
 const configuredBaseUrl = import.meta.env?.VITE_API_URL?.trim();
 const DEFAULT_API_BASE_URL = "http://localhost:8000";
 
@@ -135,6 +126,15 @@ export interface StockMovementCreate
   notes?: string | null;
 }
 
+/** Saldo actual de un producto en un almacén concreto. */
+export interface StockLevel {
+  id: number;
+  product_id: number;
+  warehouse_id: number;
+  quantity: number;
+  updated_at: string;
+}
+
 // --------------------------------------------------------------------------- //
 // Filtros y paginación
 // --------------------------------------------------------------------------- //
@@ -163,6 +163,11 @@ export interface MovementFilters extends PaginationFilters {
   movement_type?: MovementType;
   date_from?: string;
   date_to?: string;
+}
+
+export interface StockFilters extends PaginationFilters {
+  product_id?: number;
+  warehouse_id?: number;
 }
 
 // --------------------------------------------------------------------------- //
@@ -324,6 +329,16 @@ export function createMovement(
 }
 
 // --------------------------------------------------------------------------- //
+// Existencias — /api/v1/inventory/stock
+// --------------------------------------------------------------------------- //
+
+export function listStock(filters: StockFilters = {}): Promise<StockLevel[]> {
+  return request<StockLevel[]>(
+    `${INVENTORY_PATH}/stock${buildQuery(filters)}`,
+  );
+}
+
+// --------------------------------------------------------------------------- //
 // Claves de caché de TanStack Query
 // --------------------------------------------------------------------------- //
 
@@ -345,6 +360,11 @@ export const inventoryKeys = {
     all: ["inventory", "movements"] as const,
     list: (filters: MovementFilters) =>
       ["inventory", "movements", "list", filters] as const,
+  },
+  stock: {
+    all: ["inventory", "stock"] as const,
+    list: (filters: StockFilters) =>
+      ["inventory", "stock", "list", filters] as const,
   },
 } as const;
 
@@ -368,6 +388,14 @@ export function useWarehouses(filters: WarehouseFilters = {}) {
   });
 }
 
+/** Saldos actuales por producto y almacén. */
+export function useStock(filters: StockFilters = {}) {
+  return useQuery({
+    queryKey: inventoryKeys.stock.list(filters),
+    queryFn: () => listStock(filters),
+  });
+}
+
 /**
  * Registra un movimiento y refresca el historial.
  *
@@ -382,6 +410,9 @@ export function useCreateMovement() {
     onSuccess: () => {
       void queryClient.invalidateQueries({
         queryKey: inventoryKeys.movements.all,
+      });
+      void queryClient.invalidateQueries({
+        queryKey: inventoryKeys.stock.all,
       });
     },
   });

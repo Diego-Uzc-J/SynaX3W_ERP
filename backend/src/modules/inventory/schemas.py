@@ -27,6 +27,7 @@ __all__ = [
     "ProductUpdate",
     "StockMovementCreate",
     "StockMovementResponse",
+    "StockResponse",
     "WarehouseCreate",
     "WarehouseResponse",
     "WarehouseUpdate",
@@ -254,3 +255,17 @@ class StockMovementResponse(StockMovementBase):
 
     id: int
     created_at: datetime
+
+
+class StockResponse(BaseModel):
+    """Representación de salida del saldo de un producto en un almacén."""
+
+    model_config = ConfigDict(
+        str_strip_whitespace=True, extra="forbid", from_attributes=True
+    )
+
+    id: int
+    product_id: int
+    warehouse_id: int
+    quantity: int = Field(description="Cantidad actual disponible.")
+    updated_at: datetime

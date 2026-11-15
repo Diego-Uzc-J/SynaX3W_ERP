@@ -41,6 +41,7 @@ from src.modules.inventory.models import Stock, StockMovement  # noqa: E402
 MOVEMENTS_URL = "/api/v1/inventory/movements"
 PRODUCTS_URL = "/api/v1/inventory/products"
 WAREHOUSES_URL = "/api/v1/inventory/warehouses"
+STOCK_URL = "/api/v1/inventory/stock"
 
 
 # --------------------------------------------------------------------------- #
@@ -211,6 +212,15 @@ def test_inbound_updates_stock_to_ten_and_creates_history(
     # ...el stock queda exactamente en 10...
     assert _quantity(db_session, product_id, warehouse_id) == 10
 
+    # ...el endpoint de existencias lo refleja...
+    stock_levels = client.get(
+        STOCK_URL, params={"product_id": product_id}
+    ).json()
+    assert len(stock_levels) == 1
+    assert stock_levels[0]["product_id"] == product_id
+    assert stock_levels[0]["warehouse_id"] == warehouse_id
+    assert stock_levels[0]["quantity"] == 10
+
     # ...y se creó exactamente un registro en el historial.
     assert _movement_count(db_session) == 1
     history = client.get(
@@ -266,6 +276,10 @@ def test_outbound_above_available_stock_returns_400(
     # El stock permanece en 2 y el historial no registra el intento.
     assert _quantity(db_session, product_id, warehouse_id) == 2
     assert _movement_count(db_session) == 1
+    stock_levels = client.get(
+        STOCK_URL, params={"product_id": product_id}
+    ).json()
+    assert [level["quantity"] for level in stock_levels] == [2]
     history = client.get(
         MOVEMENTS_URL, params={"product_id": product_id}
     ).json()
