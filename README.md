@@ -1,6 +1,6 @@
 # 🏢 SynaX3W_ERP
 
-**Sistema ERP Modular Full-Stack** construido bajo una arquitectura de **Monolito Modular** (`FastAPI` + `PostgreSQL`) y una interfaz **SPA moderna** (`React` + `Vite` + `TypeScript`).
+**Sistema ERP Modular Full-Stack** construido bajo una arquitectura de **Monolito Modular** (`FastAPI` + `PostgreSQL`) y una interfaz **SPA moderna** (`React` + `Vite` + `TypeScript`). Un ERP (Enterprise Resource Planning o Planificación de Recursos Empresariales) es un sistema de software para gestionar y centralizar los principales procesos de negocio de una organización.
 
 ---
 
@@ -11,7 +11,7 @@
 El desarrollo del sistema sigue la metodología **Spec-Driven Development (SDD)**: cada funcionalidad nace a partir de contratos funcionales y técnicos ubicados en `specs/` antes de escribir código en el servidor o en el cliente.
 
 ### 🧩 Módulos del Sistema
-* 📦 **Inventario y Logística (`inventory`):** Control de almacenes, stock en tiempo real y trazabilidad de movimientos.
+* 📦 **Inventario y Logística (`inventory`):** Control de almacenes, stock en tiempo real y trazabilidad de movimientos. — [Documentación inventory](docs/inventory_diagrams.md)
 * 💼 **Ventas y Facturación (`sales`):** Gestión comercial, cotizaciones, pedidos y emisión de facturas.
 * 🛒 **Compras y Proveedores (`purchasing`):** Órdenes de compra, recepciones y gestión de abastecimiento.
 * 📊 **Finanzas y Contabilidad (`accounting`):** Partida doble, asientos contables y reportes financieros.
@@ -26,7 +26,7 @@ El desarrollo del sistema sigue la metodología **Spec-Driven Development (SDD)*
 | :--- | :--- |
 | **Backend** | Python 3.15+, FastAPI, SQLAlchemy 2.1+, Alembic, Pydantic v2, `uv`, Ruff, Pytest |
 | **Frontend** | React 19+, Vite 8+, TypeScript 5.8+, TanStack Query v5, Zustand v5, Tailwind CSS v4, React Router v7, Vitest |
-| **Base de Datos** | PostgreSQL 18+ |
+| **Base de Datos** | PostgreSQL 18+ (Producción) y SQLite (Desarrollo) |
 | **Infraestructura** | Docker & Docker Compose |
 
 
