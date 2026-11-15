@@ -11,7 +11,7 @@
 El desarrollo del sistema sigue la metodología **Spec-Driven Development (SDD)**: cada funcionalidad nace a partir de contratos funcionales y técnicos ubicados en `specs/` antes de escribir código en el servidor o en el cliente.
 
 ### 🧩 Módulos del Sistema
-* 📦 **Inventario y Logística (`inventory`):** Control de almacenes, stock en tiempo real y trazabilidad de movimientos. — [Documentación inventory](docs/inventory_diagrams.md)
+* 📦 **Inventario y Logística (`inventory`):** Control de almacenes, stock en tiempo real y trazabilidad de movimientos.
 * 💼 **Ventas y Facturación (`sales`):** Gestión comercial, cotizaciones, pedidos y emisión de facturas.
 * 🛒 **Compras y Proveedores (`purchasing`):** Órdenes de compra, recepciones y gestión de abastecimiento.
 * 📊 **Finanzas y Contabilidad (`accounting`):** Partida doble, asientos contables y reportes financieros.
@@ -28,6 +28,13 @@ El desarrollo del sistema sigue la metodología **Spec-Driven Development (SDD)*
 | **Frontend** | React 19+, Vite 8+, TypeScript 5.8+, TanStack Query v5, Zustand v5, Tailwind CSS v4, React Router v7, Vitest |
 | **Base de Datos** | PostgreSQL 18+ (Producción) y SQLite (Desarrollo) |
 | **Infraestructura** | Docker & Docker Compose |
+
+---
+
+## 📚 Documentación y Guías
+
+* 🗄️ **Base de Datos y Migraciones:** Configuración de PostgreSQL, Docker Compose y uso de Alembic. — [Ver guía de base de datos](docs/database_setup.md)
+* 📦 **Diagramas de Inventario:** Arquitectura y flujos del módulo de inventario. — [Ver diagramas](docs/inventory_diagrams.md)
 
 
 ---
