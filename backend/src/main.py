@@ -1,8 +1,11 @@
 """Punto de entrada de la API del ERP modular (FastAPI).
 
-Registra los routers de cada módulo de negocio. Por ahora solo se expone el
-módulo de inventario bajo el prefijo ``/api/v1/inventory``, conforme a
-``specs/inventory_spec.md`` (sección 4).
+Registra los routers de cada módulo de negocio: inventario bajo
+``/api/v1/inventory`` y usuarios/autenticación bajo ``/api/v1/users``,
+conforme a ``specs/inventory_spec.md`` y ``specs/users_spec.md``.
+
+``slowapi`` se configura a nivel de aplicación (``app.state.limiter``) para
+aplicar los límites de ``/auth/captcha`` y ``/auth/login``.
 
 Al arrancar se ejecuta el seeding idempotente del módulo ``users`` (roles y
 superusuario inicial). Si las migraciones aún no se aplicaron, el hook lo
@@ -16,13 +19,21 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
 
 from src.modules.inventory.router import (
     inventory_exception_handler,
     router as inventory_router,
 )
 from src.modules.inventory.services import InventoryError
+from src.modules.users.router import (
+    limiter as users_limiter,
+    router as users_router,
+    users_exception_handler,
+)
 from src.modules.users.seeding import seed_users_on_startup
+from src.modules.users.services import UserServiceError
 
 
 @asynccontextmanager
@@ -39,6 +50,11 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# slowapi necesita el limitador en ``app.state`` para aplicar los cupos de
+# ``/api/v1/users/auth/captcha`` y ``/login``.
+app.state.limiter = users_limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 # El frontend se sirve en otro origen (Vite :5173), por lo que el navegador
 # exige CORS: sin esto las peticiones desde React fallan con "Failed to fetch".
 app.add_middleware(
@@ -54,4 +70,8 @@ app.add_middleware(
 # Traduce las excepciones de dominio de inventario a respuestas HTTP.
 app.add_exception_handler(InventoryError, inventory_exception_handler)
 
+# Traduce los fallos de autenticación a 400/401/403/423 uniformes.
+app.add_exception_handler(UserServiceError, users_exception_handler)
+
 app.include_router(inventory_router, prefix="/api/v1/inventory")
+app.include_router(users_router, prefix="/api/v1/users")
