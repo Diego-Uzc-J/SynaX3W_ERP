@@ -59,17 +59,23 @@ if str(BACKEND_ROOT) not in sys.path:
 os.environ["DATABASE_URL"] = "sqlite://"
 
 from src.core.database import Base, get_db  # noqa: E402
+from src.core.security import create_access_token, hash_password  # noqa: E402
 from src.main import app  # noqa: E402
 from src.modules.inventory.models import (  # noqa: E402
     Stock,
     StockMovement,
 )
 from src.modules.inventory.services import ImmutableMovementError  # noqa: E402
+from src.modules.users.models import Role, RoleEnum, User  # noqa: E402
 
 MOVEMENTS_URL = "/api/v1/inventory/movements"
 PRODUCTS_URL = "/api/v1/inventory/products"
 WAREHOUSES_URL = "/api/v1/inventory/warehouses"
 STOCK_URL = "/api/v1/inventory/stock"
+
+#: Hash calculado una sola vez: estas pruebas no hacen login, solo necesitan un
+#: usuario administrador válido para la guardia RBAC del inventario.
+_ADMIN_HASHED_PASSWORD = hash_password("Inventory1234!")
 
 
 # --------------------------------------------------------------------------- #
@@ -120,16 +126,58 @@ def db_session(db_engine: Engine) -> Generator[Session, None, None]:
         yield session
 
 
+def _seed_admin(db_session: Session) -> User:
+    """Crea (idempotentemente) un administrador para las guardias RBAC."""
+    role = db_session.scalar(
+        select(Role).where(Role.name == RoleEnum.ADMINISTRATOR)
+    )
+    if role is None:
+        role = Role(
+            name=RoleEnum.ADMINISTRATOR,
+            description="Acceso total.",
+            allowed_modules=["users", "inventory", "sales"],
+        )
+        db_session.add(role)
+        db_session.flush()
+
+    user = db_session.scalar(
+        select(User).where(User.email == "inventory-admin@example.com")
+    )
+    if user is None:
+        user = User(
+            email="inventory-admin@example.com",
+            username="inventory_admin",
+            full_name="Inventory Admin",
+            hashed_password=_ADMIN_HASHED_PASSWORD,
+            role_id=role.id,
+            is_active=True,
+        )
+        db_session.add(user)
+        db_session.commit()
+        db_session.refresh(user)
+    return user
+
+
 @pytest.fixture()
 def client(db_session: Session) -> Generator[TestClient, None, None]:
-    """Cliente HTTP con la dependencia ``get_db`` apuntando a la BD de prueba."""
+    """Cliente HTTP autenticado como ``ADMINISTRATOR``.
+
+    El módulo de inventario exige token desde el Hito 4 (spec de users, 4.3);
+    estas pruebas conservan su foco en las reglas de negocio usando el bypass
+    de administrador.
+    """
 
     def override_get_db() -> Generator[Session, None, None]:
         yield db_session
 
+    admin = _seed_admin(db_session)
+
     app.dependency_overrides[get_db] = override_get_db
     try:
         with TestClient(app) as test_client:
+            test_client.headers.update(
+                {"Authorization": f"Bearer {create_access_token(admin.id)}"}
+            )
             yield test_client
     finally:
         app.dependency_overrides.pop(get_db, None)

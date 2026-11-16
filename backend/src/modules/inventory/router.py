@@ -22,6 +22,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from src.core.database import get_db
+from src.core.security import require_roles
 from src.modules.inventory import services
 from src.modules.inventory.models import MovementType
 from src.modules.inventory.schemas import (
@@ -43,8 +44,30 @@ from src.modules.inventory.services import (
     InventoryError,
     ResourceNotFoundError,
 )
+from src.modules.users.models import RoleEnum
 
 __all__ = ["inventory_exception_handler", "router"]
+
+
+# --------------------------------------------------------------------------- #
+# Guardias RBAC (spec de users, sección 4.3)
+# --------------------------------------------------------------------------- #
+
+#: Roles con escritura completa en inventario (``ADMINISTRATOR`` pasa siempre).
+INVENTORY_WRITE_ROLES = [RoleEnum.INVENTORY]
+
+#: Roles con acceso de solo lectura: ``SALES`` (stock), ``PURCHASING``
+#: (productos/proveedores) y ``MANUFACTURING`` (materias primas). ``ACCOUNTING``
+#: y ``HR`` no incluyen ``inventory`` en su matriz de módulos.
+INVENTORY_READ_ROLES = [
+    RoleEnum.INVENTORY,
+    RoleEnum.SALES,
+    RoleEnum.PURCHASING,
+    RoleEnum.MANUFACTURING,
+]
+
+require_inventory_write = require_roles(INVENTORY_WRITE_ROLES)
+require_inventory_read = require_roles(INVENTORY_READ_ROLES)
 
 
 _ERROR_STATUS: tuple[tuple[type[InventoryError], int], ...] = (
@@ -83,6 +106,7 @@ products_router = APIRouter(prefix="/products", tags=["inventory: products"])
     response_model=ProductResponse,
     status_code=status.HTTP_201_CREATED,
     summary="Crear un producto",
+    dependencies=[Depends(require_inventory_write)],
 )
 def create_product(
     payload: ProductCreate,
@@ -98,6 +122,7 @@ def create_product(
     response_model=list[ProductResponse],
     status_code=status.HTTP_200_OK,
     summary="Listar productos",
+    dependencies=[Depends(require_inventory_read)],
 )
 def list_products(
     skip: int = Query(0, ge=0, description="Registros a omitir."),
@@ -124,6 +149,7 @@ def list_products(
     response_model=ProductResponse,
     status_code=status.HTTP_200_OK,
     summary="Obtener un producto",
+    dependencies=[Depends(require_inventory_read)],
 )
 def get_product(
     product_id: int = Path(gt=0),
@@ -139,6 +165,7 @@ def get_product(
     response_model=ProductResponse,
     status_code=status.HTTP_200_OK,
     summary="Actualizar un producto",
+    dependencies=[Depends(require_inventory_write)],
 )
 def update_product(
     payload: ProductUpdate,
@@ -162,6 +189,7 @@ warehouses_router = APIRouter(prefix="/warehouses", tags=["inventory: warehouses
     response_model=WarehouseResponse,
     status_code=status.HTTP_201_CREATED,
     summary="Registrar un almacén",
+    dependencies=[Depends(require_inventory_write)],
 )
 def create_warehouse(
     payload: WarehouseCreate,
@@ -177,6 +205,7 @@ def create_warehouse(
     response_model=list[WarehouseResponse],
     status_code=status.HTTP_200_OK,
     summary="Listar almacenes",
+    dependencies=[Depends(require_inventory_read)],
 )
 def list_warehouses(
     active_only: bool = Query(
@@ -214,6 +243,7 @@ movements_router = APIRouter(prefix="/movements", tags=["inventory: movements"])
     response_model=StockMovementResponse,
     status_code=status.HTTP_201_CREATED,
     summary="Registrar un movimiento de inventario",
+    dependencies=[Depends(require_inventory_write)],
 )
 def create_stock_movement(
     payload: StockMovementCreate,
@@ -233,6 +263,7 @@ def create_stock_movement(
     response_model=list[StockMovementResponse],
     status_code=status.HTTP_200_OK,
     summary="Consultar el historial de movimientos",
+    dependencies=[Depends(require_inventory_read)],
 )
 def list_stock_movements(
     skip: int = Query(0, ge=0),
@@ -274,6 +305,7 @@ stock_router = APIRouter(prefix="/stock", tags=["inventory: stock"])
     response_model=list[StockResponse],
     status_code=status.HTTP_200_OK,
     summary="Consultar niveles de existencias",
+    dependencies=[Depends(require_inventory_read)],
 )
 def list_stock(
     skip: int = Query(0, ge=0),
