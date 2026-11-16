@@ -23,3 +23,6 @@ frontend/*.local
 
 # Python (build)
 *.egg-info/
+
+MEMORY.md
+memory/users_memory.md
