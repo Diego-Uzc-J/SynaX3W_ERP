@@ -11,18 +11,10 @@
  */
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
-// --------------------------------------------------------------------------- //
-// Configuración y entorno
-// --------------------------------------------------------------------------- //
+import { apiRequest } from "./client";
+import { buildQuery } from "./config";
 
-const configuredBaseUrl = import.meta.env?.VITE_API_URL?.trim();
-const DEFAULT_API_BASE_URL = "http://localhost:8000";
-
-/** URL base del backend, sin barra final. */
-export const API_BASE_URL = (configuredBaseUrl || DEFAULT_API_BASE_URL).replace(
-  /\/+$/,
-  "",
-);
+export { ApiError as InventoryApiError } from "./client";
 
 const INVENTORY_PATH = "/api/v1/inventory";
 
@@ -174,87 +166,14 @@ export interface StockFilters extends PaginationFilters {
 // Cliente HTTP
 // --------------------------------------------------------------------------- //
 
-/** Error HTTP con el status y el payload devuelto por la API. */
-export class InventoryApiError extends Error {
-  readonly status: number;
-  readonly payload: unknown;
-
-  constructor(message: string, status: number, payload: unknown) {
-    super(message);
-    this.name = "InventoryApiError";
-    this.status = status;
-    this.payload = payload;
-  }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
-}
-
-function extractErrorMessage(payload: unknown, status: number): string {
-  if (isRecord(payload) && "detail" in payload) {
-    const detail = payload.detail;
-    if (typeof detail === "string" && detail.length > 0) {
-      return detail;
-    }
-    // Errores de validación de FastAPI/Pydantic: `detail` es una lista.
-    if (Array.isArray(detail)) {
-      const messages = detail
-        .map((item) =>
-          isRecord(item) && typeof item.msg === "string"
-            ? item.msg
-            : String(item),
-        )
-        .filter((message) => message.length > 0);
-      if (messages.length > 0) {
-        return messages.join("; ");
-      }
-    }
-  }
-  return `Error HTTP ${status} al comunicarse con el módulo de inventario`;
-}
-
-function buildQuery(params: object): string {
-  const search = new URLSearchParams();
-  for (const [key, value] of Object.entries(
-    params as Record<string, unknown>,
-  )) {
-    if (value === undefined || value === null || value === "") {
-      continue;
-    }
-    search.set(key, String(value));
-  }
-  const queryString = search.toString();
-  return queryString ? `?${queryString}` : "";
-}
-
+/**
+ * Delegado al cliente común del ERP.
+ *
+ * `apiRequest` añade el Bearer token, traduce los errores de FastAPI y renueva
+ * el access token automáticamente cuando recibe un 401.
+ */
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const headers = new Headers(init?.headers);
-  headers.set("Accept", "application/json");
-  if (init?.body !== undefined) {
-    headers.set("Content-Type", "application/json");
-  }
-
-  const response = await fetch(`${API_BASE_URL}${path}`, {
-    ...init,
-    headers,
-  });
-
-  if (!response.ok) {
-    let payload: unknown;
-    try {
-      payload = await response.json();
-    } catch {
-      payload = undefined;
-    }
-    throw new InventoryApiError(
-      extractErrorMessage(payload, response.status),
-      response.status,
-      payload,
-    );
-  }
-
-  return (await response.json()) as T;
+  return apiRequest<T>(path, init);
 }
 
 // --------------------------------------------------------------------------- //

@@ -3,8 +3,8 @@ import type { FormEvent } from "react";
 
 import { useCreateProduct, useUpdateProduct } from "../../api/inventory";
 import type { Product, ProductCreate } from "../../api/inventory";
-import ActiveSwitch from "./ActiveSwitch";
-import FormSheet from "./FormSheet";
+import ActiveSwitch from "../../components/ActiveSwitch";
+import FormSheet from "../../components/FormSheet";
 
 interface ProductFormProps {
   open: boolean;

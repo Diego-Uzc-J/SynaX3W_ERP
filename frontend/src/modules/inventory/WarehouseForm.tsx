@@ -3,8 +3,8 @@ import type { FormEvent } from "react";
 
 import { useCreateWarehouse } from "../../api/inventory";
 import type { Warehouse, WarehouseCreate } from "../../api/inventory";
-import ActiveSwitch from "./ActiveSwitch";
-import FormSheet from "./FormSheet";
+import ActiveSwitch from "../../components/ActiveSwitch";
+import FormSheet from "../../components/FormSheet";
 
 interface WarehouseFormProps {
   open: boolean;
