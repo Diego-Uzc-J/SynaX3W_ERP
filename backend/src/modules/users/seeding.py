@@ -23,17 +23,15 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 
-from pwdlib import PasswordHash
 from sqlalchemy import inspect, or_, select, text
 from sqlalchemy.orm import Session
 
 from src.core.config import settings
 from src.core.database import SessionLocal, engine
+from src.core.security import hash_password
 from src.modules.users.models import Role, RoleEnum, User
 
 logger = logging.getLogger(__name__)
-
-_password_hasher = PasswordHash.recommended()
 
 
 @dataclass(frozen=True)
@@ -167,7 +165,7 @@ def _ensure_superuser(db: Session) -> bool:
             email=email,
             username=username,
             full_name=settings.FIRST_SUPERUSER_FULL_NAME,
-            hashed_password=_password_hasher.hash(password),
+            hashed_password=hash_password(password),
             role_id=administrator.id,
             is_active=True,
         )
