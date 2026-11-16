@@ -10,8 +10,13 @@ requires-python = ">=3.12"
 dependencies = [
     "alembic>=1.13",
     "fastapi>=0.115",
+    "itsdangerous>=2.2",
     "psycopg[binary]>=3.2",
-    "pydantic>=2.7",
+    "pwdlib[argon2]>=0.2",
+    "pydantic[email]>=2.7",
+    "pydantic-settings>=2.3",
+    "PyJWT[crypto]>=2.9",
+    "slowapi>=0.1.9",
     "sqlalchemy>=2.0.30",
     "uvicorn[standard]>=0.30",
 ]

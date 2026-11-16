@@ -2,8 +2,8 @@
 
 Toma la URL de conexión de ``src.core.database.DATABASE_URL`` (que normaliza
 ``postgresql://`` a ``postgresql+psycopg://``) y compara contra
-``Base.metadata``. Importar ``src.modules.inventory.models`` registra las
-cuatro tablas del módulo en los metadatos.
+``Base.metadata``. Importar los modelos de cada módulo registra sus tablas en
+los metadatos.
 """
 
 from __future__ import annotations
@@ -14,7 +14,8 @@ from alembic import context
 from sqlalchemy import engine_from_config, pool
 
 from src.core.database import Base, DATABASE_URL
-from src.modules.inventory import models  # noqa: F401  (registra las tablas)
+from src.modules.inventory import models as inventory_models  # noqa: F401
+from src.modules.users import models as users_models  # noqa: F401
 
 # Objeto de configuración de Alembic.
 config = context.config

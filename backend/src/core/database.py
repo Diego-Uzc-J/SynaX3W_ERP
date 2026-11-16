@@ -4,20 +4,20 @@ Expone la clase declarativa ``Base`` que heredan todos los modelos de los
 módulos, el ``engine`` y la fábrica de sesiones, además de la dependencia
 ``get_db`` para los endpoints de FastAPI.
 
-La URL de conexión se toma de la variable de entorno ``DATABASE_URL``; si no
-está definida se usa el valor por defecto alineado con ``docker-compose.yml``.
+La URL de conexión se toma de ``src.core.config.settings`` (que lee
+``DATABASE_URL``); si no está definida se usa el valor por defecto alineado con
+``docker-compose.yml``.
 """
 
 from __future__ import annotations
 
-import os
 from collections.abc import Generator
 
 from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
-DEFAULT_DATABASE_URL = "postgresql://erp_user:erp_password@localhost:5432/erp_database"
+from src.core.config import settings
 
 
 def _normalize_database_url(url: str) -> str:
@@ -34,16 +34,9 @@ def _normalize_database_url(url: str) -> str:
     return url
 
 
-DATABASE_URL = _normalize_database_url(
-    os.getenv("DATABASE_URL", DEFAULT_DATABASE_URL)
-)
+DATABASE_URL = _normalize_database_url(settings.DATABASE_URL)
 
-SQLALCHEMY_ECHO = os.getenv("SQLALCHEMY_ECHO", "").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
+SQLALCHEMY_ECHO = settings.SQLALCHEMY_ECHO
 
 engine: Engine = create_engine(
     DATABASE_URL,
