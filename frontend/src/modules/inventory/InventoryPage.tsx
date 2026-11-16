@@ -1,4 +1,5 @@
 import { useCallback, useDeferredValue, useEffect, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 
 import { useProducts, useStock, useWarehouses } from "../../api/inventory";
 import type {
@@ -6,54 +7,16 @@ import type {
   StockLevel,
   StockMovement,
 } from "../../api/inventory";
+import InventoryTabs from "./InventoryTabs";
 import MovementFormModal from "./MovementFormModal";
+import StatusBadge from "./StatusBadge";
 import { MOVEMENT_LABELS } from "./constants";
+import { formatPrice } from "./format";
 
 const PAGE_SIZE = 12;
 
 type SearchField = "sku" | "name";
 type StatusFilter = "all" | "active" | "inactive";
-
-const priceFormatter = new Intl.NumberFormat("es-CO", {
-  minimumFractionDigits: 2,
-  maximumFractionDigits: 2,
-});
-
-function formatPrice(value: string): string {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? priceFormatter.format(parsed) : value;
-}
-
-function StatusBadge({
-  isActive,
-  isLow,
-}: {
-  isActive: boolean;
-  isLow: boolean;
-}) {
-  if (!isActive) {
-    return (
-      <span className="inline-flex items-center gap-1.5 bg-concrete-100 px-2 py-1 text-xs font-semibold text-ink-500">
-        <span className="size-1.5 bg-concrete-400" aria-hidden="true" />
-        Inactivo
-      </span>
-    );
-  }
-  if (isLow) {
-    return (
-      <span className="inline-flex items-center gap-1.5 bg-clay-100 px-2 py-1 text-xs font-semibold text-clay-600">
-        <span className="size-1.5 bg-clay-600" aria-hidden="true" />
-        Bajo mínimo
-      </span>
-    );
-  }
-  return (
-    <span className="inline-flex items-center gap-1.5 bg-pine-100 px-2 py-1 text-xs font-semibold text-pine-600">
-      <span className="size-1.5 bg-pine-600" aria-hidden="true" />
-      Disponible
-    </span>
-  );
-}
 
 function StockMeter({
   quantity,
@@ -258,6 +221,8 @@ export default function InventoryPage() {
         </button>
       </header>
 
+      <InventoryTabs />
+
       <dl className="grid grid-cols-2 gap-px border-b border-concrete-200 bg-concrete-200 sm:grid-cols-4">
         {stats.map((stat) => (
           <div key={stat.label} className="bg-concrete-50 px-4 py-4">
@@ -387,7 +352,14 @@ export default function InventoryPage() {
             >
               Limpiar filtros
             </button>
-          ) : null}
+          ) : (
+            <Link
+              to="/inventory/products"
+              className="mt-5 inline-block border border-ink-950 px-4 py-2 text-sm font-semibold hover:bg-ink-950 hover:text-concrete-50"
+            >
+              Ir al catálogo de productos
+            </Link>
+          )}
         </div>
       ) : (
         <div className="border border-concrete-200 bg-white">
@@ -484,7 +456,8 @@ export default function InventoryPage() {
 
           <footer className="flex items-center justify-between gap-4 border-t border-concrete-200 px-4 py-3 text-sm">
             <p className="text-xs text-ink-500">
-              {products.length} productos en esta página
+              {products.length} producto{products.length === 1 ? "" : "s"} en
+              esta página
             </p>
             <div className="flex gap-2">
               <button

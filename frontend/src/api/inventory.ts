@@ -397,6 +397,71 @@ export function useStock(filters: StockFilters = {}) {
 }
 
 /**
+ * Crea un producto e invalida el catálogo.
+ *
+ * Las vistas de existencias derivan sus columnas y sus alertas de
+ * `useProducts`, así que basta con refrescar `products.all`.
+ */
+export function useCreateProduct() {
+  const queryClient = useQueryClient();
+
+  return useMutation<Product, Error, ProductCreate>({
+    mutationFn: createProduct,
+    onSuccess: (product) => {
+      queryClient.setQueryData(
+        inventoryKeys.products.detail(product.id),
+        product,
+      );
+      void queryClient.invalidateQueries({
+        queryKey: inventoryKeys.products.all,
+      });
+    },
+  });
+}
+
+export interface UpdateProductVariables {
+  productId: number;
+  payload: ProductUpdate;
+}
+
+/** Actualiza un producto (PATCH) y refresca el catálogo. */
+export function useUpdateProduct() {
+  const queryClient = useQueryClient();
+
+  return useMutation<Product, Error, UpdateProductVariables>({
+    mutationFn: ({ productId, payload }) => updateProduct(productId, payload),
+    onSuccess: (product) => {
+      queryClient.setQueryData(
+        inventoryKeys.products.detail(product.id),
+        product,
+      );
+      void queryClient.invalidateQueries({
+        queryKey: inventoryKeys.products.all,
+      });
+    },
+  });
+}
+
+/**
+ * Registra una bodega e invalida el listado de almacenes.
+ *
+ * La tabla de existencias arma una columna por bodega a partir de este listado,
+ * por lo que la invalidación también refresca esa vista.
+ */
+export function useCreateWarehouse() {
+  const queryClient = useQueryClient();
+
+  return useMutation<Warehouse, Error, WarehouseCreate>({
+    mutationFn: createWarehouse,
+    onSuccess: () => {
+      void queryClient.invalidateQueries({
+        queryKey: inventoryKeys.warehouses.all,
+      });
+    },
+  });
+}
+
+/**
  * Registra un movimiento y refresca el historial.
  *
  * La API actualiza `Stock` en la misma transacción, por lo que las vistas que
