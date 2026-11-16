@@ -70,7 +70,7 @@ export default function AppLayout() {
               SX
             </span>
             <div className="hidden lg:block">
-              <p className="text-sm font-semibold text-concrete-50">SynapsisX</p>
+              <p className="text-sm font-semibold text-concrete-50">SynapsisXcor3</p>
               <p className="text-xs text-concrete-400">ERP modular</p>
             </div>
           </div>
@@ -185,7 +185,7 @@ export default function AppLayout() {
             <span className="grid size-8 place-items-center bg-signal-500 text-xs font-extrabold tracking-tight text-white">
               SX
             </span>
-            <span className="text-sm font-semibold">SynapsisX ERP</span>
+            <span className="text-sm font-semibold">SynapsisXcor3 ERP</span>
           </div>
           <div className="flex min-w-0 items-center gap-3">
             <nav

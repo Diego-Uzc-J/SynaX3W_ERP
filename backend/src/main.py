@@ -44,7 +44,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(
-    title="SynapsisX ERP API",
+    title="SynapsisXcor3 ERP API",
     version="0.1.0",
     description="API del ERP modular construido con FastAPI y SQLAlchemy.",
     lifespan=lifespan,
