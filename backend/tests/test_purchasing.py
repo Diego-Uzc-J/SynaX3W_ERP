@@ -1,28 +1,35 @@
-"""Pruebas de aceptación de la capa de servicios de ``purchasing``.
+"""Pruebas de aceptación del módulo ``purchasing``.
 
-Cubren los escenarios 1, 2, 3, 4, 6 y 7 de ``specs/purchasing_spec.md``:
-recepción exitosa con impacto en stock, proveedor inactivo, ``tax_id``
-duplicado, sobre-recepción, inmutabilidad de la recepción y producto inactivo
-en una línea de OC. También verifican la secuenciación de códigos
-``OC-YYYY-XXXX`` / ``REC-YYYY-XXXX`` y el recálculo de totales.
+Cubren los escenarios críticos de ``specs/purchasing_spec.md`` en dos niveles:
 
-Las pruebas son de servicio (sin router todavía) y usan SQLite en memoria; por
-ello comprueban directamente el ``status_code`` de las excepciones HTTP de
-dominio, que es el mismo que FastAPI devolverá al registrar el router. Las
-recepciones se validan contra las tablas de ``inventory`` para confirmar la
-atomicidad de la operación.
+* **Servicios:** recepción exitosa con impacto en stock y cierre de la OC,
+  proveedor inactivo, ``tax_id`` duplicado, sobre-recepción, inmutabilidad de
+  la recepción, producto inactivo en una línea de OC, facturación, pagos y
+  secuenciación de códigos ``OC-YYYY-XXXX`` / ``REC-YYYY-XXXX``.
+* **HTTP/RBAC:** los mismos escenarios a través del router real
+  (``TestClient``), verificando los códigos de estado 201/400/409 y el rechazo
+  403 a usuarios sin los roles ``PURCHASING`` o ``ADMINISTRATOR``.
+
+Todo usa SQLite en memoria. Las pruebas de servicio comprueban directamente el
+``status_code`` de las excepciones HTTP de dominio; las de HTTP validan que el
+manejador registrado en ``src.main`` las traduce igual. Las recepciones se
+validan contra las tablas de ``inventory`` para confirmar la atomicidad.
 """
 
 from __future__ import annotations
 
 import os
 import sys
+from collections.abc import Generator
 from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
 
 import pytest
-from sqlalchemy import create_engine, select
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine, event, select
+from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -32,7 +39,9 @@ if str(BACKEND_ROOT) not in sys.path:
 
 os.environ["DATABASE_URL"] = "sqlite://"
 
-from src.core.database import Base  # noqa: E402
+from src.core.database import Base, get_db  # noqa: E402
+from src.core.security import create_access_token, hash_password  # noqa: E402
+from src.main import app  # noqa: E402
 from src.modules.inventory import services as inventory_services  # noqa: E402
 from src.modules.inventory.models import (  # noqa: E402
     MovementType,
@@ -95,6 +104,7 @@ from src.modules.purchasing.services import (  # noqa: E402
     update_supplier,
     void_supplier_bill,
 )
+from src.modules.users.models import Role, RoleEnum, User  # noqa: E402
 
 _TODAY = date.today()
 
@@ -1078,3 +1088,486 @@ def test_order_approve_cancel_and_force_close(
 
     closed = force_close_purchase_order(db_session, approved.id)
     assert closed.status is PurchaseOrderStatus.FORCE_CLOSED
+
+
+# --------------------------------------------------------------------------- #
+# Escenarios críticos por HTTP (router + RBAC)
+# --------------------------------------------------------------------------- #
+
+_API_URL = "/api/v1/purchasing"
+_INVENTORY_API_URL = "/api/v1/inventory"
+_API_HASHED_PASSWORD = hash_password("Purchasing1234!")
+
+
+@pytest.fixture()
+def api_engine() -> Generator[Engine, None, None]:
+    """Engine SQLite con el mismo tratamiento de ``BEGIN`` que en producción.
+
+    El driver ``pysqlite`` no emite ``BEGIN`` antes de un ``SAVEPOINT``; se
+    desactiva su transacción implícita para que los rollback atómicos se
+    comporten como en PostgreSQL.
+    """
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+
+    @event.listens_for(engine, "connect")
+    def _disable_implicit_begin(
+        dbapi_connection: Any, _connection_record: Any
+    ) -> None:
+        dbapi_connection.isolation_level = None
+
+    @event.listens_for(engine, "begin")
+    def _emit_begin(connection: Any) -> None:
+        connection.exec_driver_sql("BEGIN")
+
+    Base.metadata.create_all(engine)
+    try:
+        yield engine
+    finally:
+        Base.metadata.drop_all(engine)
+        engine.dispose()
+
+
+@pytest.fixture()
+def api_session(api_engine: Engine) -> Generator[Session, None, None]:
+    """Sesión compartida entre la API y las aserciones de cada prueba HTTP."""
+    factory = sessionmaker(bind=api_engine, expire_on_commit=False)
+    with factory() as session:
+        yield session
+
+
+@pytest.fixture()
+def client(api_session: Session) -> Generator[TestClient, None, None]:
+    """Cliente HTTP con ``get_db`` sustituido por la sesión de prueba."""
+
+    def override_get_db() -> Generator[Session, None, None]:
+        yield api_session
+
+    app.dependency_overrides[get_db] = override_get_db
+    try:
+        with TestClient(app) as test_client:
+            yield test_client
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+def _api_role(session: Session, name: RoleEnum, modules: list[str]) -> Role:
+    """Obtiene o crea un rol de forma idempotente."""
+    role = session.scalar(select(Role).where(Role.name == name))
+    if role is None:
+        role = Role(name=name, description=name.value, allowed_modules=modules)
+        session.add(role)
+        session.flush()
+    return role
+
+
+def _api_user(
+    session: Session, *, role: Role, username: str, email: str
+) -> User:
+    """Crea un usuario activo con el rol indicado."""
+    user = User(
+        email=email,
+        username=username,
+        full_name=username.title(),
+        hashed_password=_API_HASHED_PASSWORD,
+        role_id=role.id,
+        is_active=True,
+    )
+    session.add(user)
+    session.commit()
+    session.refresh(user)
+    return user
+
+
+@pytest.fixture()
+def api_accounts(api_session: Session) -> dict[str, User]:
+    """Usuarios con roles ``ADMINISTRATOR``, ``PURCHASING`` e ``INVENTORY``."""
+    admin = _api_role(api_session, RoleEnum.ADMINISTRATOR, ["*"])
+    purchasing = _api_role(
+        api_session, RoleEnum.PURCHASING, ["purchasing", "inventory:read"]
+    )
+    inventory = _api_role(api_session, RoleEnum.INVENTORY, ["inventory"])
+    api_session.commit()
+    return {
+        "admin": _api_user(
+            api_session,
+            role=admin,
+            username="admin_compras",
+            email="admin-compras@example.com",
+        ),
+        "purchasing": _api_user(
+            api_session,
+            role=purchasing,
+            username="comprador",
+            email="comprador@example.com",
+        ),
+        "inventory": _api_user(
+            api_session,
+            role=inventory,
+            username="bodeguero",
+            email="bodeguero@example.com",
+        ),
+    }
+
+
+def _api_headers(user: User) -> dict[str, str]:
+    return {"Authorization": f"Bearer {create_access_token(user.id)}"}
+
+
+@pytest.fixture()
+def admin_headers(api_accounts: dict[str, User]) -> dict[str, str]:
+    return _api_headers(api_accounts["admin"])
+
+
+@pytest.fixture()
+def purchasing_headers(api_accounts: dict[str, User]) -> dict[str, str]:
+    return _api_headers(api_accounts["purchasing"])
+
+
+@pytest.fixture()
+def inventory_headers(api_accounts: dict[str, User]) -> dict[str, str]:
+    return _api_headers(api_accounts["inventory"])
+
+
+def _api_catalog(
+    client: TestClient, admin_headers: dict[str, str]
+) -> dict[str, int]:
+    """Crea una bodega y un producto vía API (requiere rol de inventario)."""
+    warehouse = client.post(
+        f"{_INVENTORY_API_URL}/warehouses",
+        headers=admin_headers,
+        json={"code": "BOD-PRINCIPAL", "name": "Bodega Principal"},
+    )
+    assert warehouse.status_code == 201, warehouse.text
+    product = client.post(
+        f"{_INVENTORY_API_URL}/products",
+        headers=admin_headers,
+        json={
+            "sku": "LAP-001",
+            "name": "Laptop Industrial",
+            "unit_price": "1250.00",
+            "minimum_stock": 1,
+        },
+    )
+    assert product.status_code == 201, product.text
+    return {
+        "warehouse_id": warehouse.json()["id"],
+        "product_id": product.json()["id"],
+    }
+
+
+def _api_supplier(
+    client: TestClient, headers: dict[str, str], *, tax_id: str = "800987654-3"
+) -> dict[str, Any]:
+    """Registra un proveedor vía API y devuelve su representación."""
+    response = client.post(
+        f"{_API_URL}/suppliers",
+        headers=headers,
+        json={
+            "tax_id": tax_id,
+            "company_name": "Proveedores del Norte S.A.S.",
+            "contact_name": "María Gómez",
+            "email": "ventas@proveedoresnorte.com",
+            "address": "Calle 10 # 20-30",
+            "payment_terms_days": 30,
+        },
+    )
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+def _api_order(
+    client: TestClient,
+    headers: dict[str, str],
+    supplier_id: int,
+    product_id: int,
+    *,
+    quantity: int,
+) -> dict[str, Any]:
+    """Crea una OC en borrador vía API."""
+    response = client.post(
+        f"{_API_URL}/orders",
+        headers=headers,
+        json={
+            "supplier_id": supplier_id,
+            "expected_delivery_date": str(_TODAY + timedelta(days=10)),
+            "items": [
+                {
+                    "product_id": product_id,
+                    "quantity": quantity,
+                    "unit_price": "1250.00",
+                    "tax_rate": "19.00",
+                }
+            ],
+        },
+    )
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+def _api_approve(
+    client: TestClient, headers: dict[str, str], order_id: int
+) -> None:
+    """Aprueba una OC vía API."""
+    response = client.post(
+        f"{_API_URL}/orders/{order_id}/approve", headers=headers
+    )
+    assert response.status_code == 200, response.text
+
+
+def _api_receipt(
+    client: TestClient,
+    headers: dict[str, str],
+    order: dict[str, Any],
+    warehouse_id: int,
+    *,
+    quantity: int,
+) -> Any:  # noqa: ANN401 - respuesta HTTP sin tipo específico
+    """Intenta registrar una recepción y devuelve la respuesta sin asumir éxito."""
+    return client.post(
+        f"{_API_URL}/receipts",
+        headers=headers,
+        json={
+            "purchase_order_id": order["id"],
+            "warehouse_id": warehouse_id,
+            "items": [
+                {
+                    "purchase_order_item_id": order["items"][0]["id"],
+                    "quantity": quantity,
+                }
+            ],
+        },
+    )
+
+
+def test_http_supplier_created_duplicate_tax_id_and_inactive_supplier(
+    client: TestClient,
+    api_session: Session,
+    purchasing_headers: dict[str, str],
+    admin_headers: dict[str, str],
+) -> None:
+    """Escenario 1/3: alta de proveedor, NIT duplicado y proveedor inactivo.
+
+    El ``tax_id`` duplicado se rechaza con 409 (la spec admite 400/422) y una
+    OC contra un proveedor desactivado con 400.
+    """
+    supplier = _api_supplier(client, purchasing_headers)
+
+    duplicate = client.post(
+        f"{_API_URL}/suppliers",
+        headers=purchasing_headers,
+        json={
+            "tax_id": "800987654-3",
+            "company_name": "Otro proveedor",
+            "contact_name": "Carlos Pérez",
+            "email": "otro@example.com",
+            "address": "Calle 20 # 30-40",
+        },
+    )
+    assert duplicate.status_code in {400, 409, 422}
+    assert "800987654-3" in duplicate.text
+
+    deactivate = client.patch(
+        f"{_API_URL}/suppliers/{supplier['id']}",
+        headers=purchasing_headers,
+        json={"is_active": False},
+    )
+    assert deactivate.status_code == 200, deactivate.text
+    assert deactivate.json()["is_active"] is False
+
+    catalog = _api_catalog(client, admin_headers)
+    order = client.post(
+        f"{_API_URL}/orders",
+        headers=purchasing_headers,
+        json={
+            "supplier_id": supplier["id"],
+            "expected_delivery_date": str(_TODAY + timedelta(days=10)),
+            "items": [
+                {
+                    "product_id": catalog["product_id"],
+                    "quantity": 1,
+                    "unit_price": "1250.00",
+                }
+            ],
+        },
+    )
+    assert order.status_code == 400
+    assert "activo" in order.text.lower()
+    assert api_session.scalars(select(PurchaseOrder.id)).all() == []
+
+
+def test_http_inactive_product_in_order_is_rejected(
+    client: TestClient,
+    api_session: Session,
+    purchasing_headers: dict[str, str],
+    admin_headers: dict[str, str],
+) -> None:
+    """Escenario 7: incluir un producto inactivo en una OC responde 400."""
+    catalog = _api_catalog(client, admin_headers)
+    deactivate = client.patch(
+        f"{_INVENTORY_API_URL}/products/{catalog['product_id']}",
+        headers=admin_headers,
+        json={"is_active": False},
+    )
+    assert deactivate.status_code == 200, deactivate.text
+
+    supplier = _api_supplier(client, purchasing_headers)
+    response = client.post(
+        f"{_API_URL}/orders",
+        headers=purchasing_headers,
+        json={
+            "supplier_id": supplier["id"],
+            "expected_delivery_date": str(_TODAY + timedelta(days=10)),
+            "items": [
+                {
+                    "product_id": catalog["product_id"],
+                    "quantity": 5,
+                    "unit_price": "1250.00",
+                }
+            ],
+        },
+    )
+    assert response.status_code == 400
+    assert "inactivo" in response.text.lower()
+    assert api_session.scalars(select(PurchaseOrder.id)).all() == []
+
+
+def test_http_goods_receipt_completes_order_and_increases_stock(
+    client: TestClient,
+    api_session: Session,
+    purchasing_headers: dict[str, str],
+    admin_headers: dict[str, str],
+) -> None:
+    """Escenario 1: recibir 50 unidades impacta stock y cierra la OC."""
+    catalog = _api_catalog(client, admin_headers)
+    supplier = _api_supplier(client, purchasing_headers)
+    order = _api_order(
+        client,
+        purchasing_headers,
+        supplier["id"],
+        catalog["product_id"],
+        quantity=50,
+    )
+    _api_approve(client, purchasing_headers, order["id"])
+
+    receipt = _api_receipt(
+        client,
+        purchasing_headers,
+        order,
+        catalog["warehouse_id"],
+        quantity=50,
+    )
+    assert receipt.status_code == 201, receipt.text
+    assert receipt.json()["code"].startswith(f"REC-{_TODAY.year}-")
+
+    stored = client.get(
+        f"{_API_URL}/orders/{order['id']}", headers=purchasing_headers
+    )
+    assert stored.status_code == 200
+    assert stored.json()["status"] == PurchaseOrderStatus.COMPLETED.value
+    assert stored.json()["items"][0]["received_quantity"] == 50
+
+    stock = client.get(
+        f"{_INVENTORY_API_URL}/stock",
+        headers=purchasing_headers,
+        params={
+            "product_id": catalog["product_id"],
+            "warehouse_id": catalog["warehouse_id"],
+        },
+    )
+    assert stock.status_code == 200, stock.text
+    assert stock.json()[0]["quantity"] == 50
+
+    movements = api_session.scalars(select(StockMovement)).all()
+    assert len(movements) == 1
+    assert movements[0].movement_type is MovementType.INBOUND
+    assert movements[0].quantity == 50
+    assert movements[0].reference_document == receipt.json()["code"]
+
+
+def test_http_over_receipt_is_rejected_atomically(
+    client: TestClient,
+    api_session: Session,
+    purchasing_headers: dict[str, str],
+    admin_headers: dict[str, str],
+) -> None:
+    """Escenario 4: recibir 25 de 20 pendientes responde 400 sin escrituras."""
+    catalog = _api_catalog(client, admin_headers)
+    supplier = _api_supplier(client, purchasing_headers)
+    order = _api_order(
+        client,
+        purchasing_headers,
+        supplier["id"],
+        catalog["product_id"],
+        quantity=20,
+    )
+    _api_approve(client, purchasing_headers, order["id"])
+
+    response = _api_receipt(
+        client,
+        purchasing_headers,
+        order,
+        catalog["warehouse_id"],
+        quantity=25,
+    )
+    assert response.status_code == 400
+    assert "pendientes" in response.text.lower()
+
+    assert api_session.scalars(select(GoodsReceipt.id)).all() == []
+    assert api_session.scalars(select(GoodsReceiptItem.id)).all() == []
+    assert api_session.scalars(select(StockMovement.id)).all() == []
+    assert api_session.scalars(select(Stock.id)).all() == []
+
+    untouched = client.get(
+        f"{_API_URL}/orders/{order['id']}", headers=purchasing_headers
+    )
+    assert untouched.json()["status"] == PurchaseOrderStatus.APPROVED.value
+    assert untouched.json()["items"][0]["received_quantity"] == 0
+
+
+@pytest.mark.parametrize(
+    "method,path",
+    [
+        ("GET", "/suppliers"),
+        ("POST", "/suppliers"),
+        ("GET", "/orders"),
+        ("POST", "/orders"),
+        ("GET", "/receipts"),
+        ("POST", "/receipts"),
+        ("GET", "/bills"),
+    ],
+)
+def test_http_rbac_rejects_role_without_purchasing(
+    client: TestClient,
+    inventory_headers: dict[str, str],
+    method: str,
+    path: str,
+) -> None:
+    """Escenario 5: un rol sin ``PURCHASING``/``ADMINISTRATOR`` recibe 403."""
+    response = client.request(
+        method, f"{_API_URL}{path}", headers=inventory_headers, json={}
+    )
+    assert response.status_code == 403
+
+
+@pytest.mark.parametrize("headers_name", ["purchasing_headers", "admin_headers"])
+def test_http_rbac_allows_authorized_roles(
+    request: pytest.FixtureRequest,
+    client: TestClient,
+    headers_name: str,
+) -> None:
+    """Los roles ``PURCHASING`` y ``ADMINISTRATOR`` pueden operar (bypass)."""
+    headers: dict[str, str] = request.getfixturevalue(headers_name)
+    assert client.get(f"{_API_URL}/suppliers", headers=headers).status_code == 200
+    assert client.get(f"{_API_URL}/orders", headers=headers).status_code == 200
+    assert client.get(f"{_API_URL}/receipts", headers=headers).status_code == 200
+    assert client.get(f"{_API_URL}/bills", headers=headers).status_code == 200
+
+
+def test_http_rbac_rejects_anonymous_request(client: TestClient) -> None:
+    """Sin token, el acceso responde 401 antes que 403."""
+    response = client.get(f"{_API_URL}/suppliers")
+    assert response.status_code == 401
