@@ -300,8 +300,8 @@ class PurchaseOrderCreate(PurchasingSchema):
 class PurchaseOrderUpdate(PurchasingSchema):
     """Edición parcial de una OC aún editable.
 
-    El servicio solo admite cambios mientras la orden esté en ``DRAFT`` o
-    ``SENT`` (regla de negocio 1: una vez `APPROVED` sus líneas son
+    El servicio solo admite cambios mientras la orden esté en ``DRAFT``
+    (regla de negocio 1: una vez ``SENT`` o ``APPROVED`` sus líneas son
     inmutables). Si se envían ``items``, reemplazan por completo a las líneas
     anteriores y el servicio recalcula los totales. El ``code`` no se puede
     modificar.
