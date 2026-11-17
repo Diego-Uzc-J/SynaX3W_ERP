@@ -44,6 +44,7 @@ __all__ = [
     "SalesOrderItemResponse",
     "SalesOrderResponse",
     "SalesOrderStatus",
+    "SalesOrderUpdate",
 ]
 
 #: Unidad mínima de los importes monetarios del ERP.
@@ -232,15 +233,20 @@ class SalesOrderItemCreate(SalesSchema):
 class SalesOrderCreate(SalesSchema):
     """Datos para crear una cotización o un pedido en borrador.
 
-    Los totales se calculan a partir de las líneas y no se aceptan como fuente
-    de verdad: cualquier valor enviado en ``subtotal``, ``tax_amount`` o
-    ``total`` se sobrescribe.
+    Si ``code`` se omite, el servicio genera un código secuencial
+    ``PED-YYYY-XXXX``; si se envía, debe ser único. Los totales se calculan a
+    partir de las líneas y no se aceptan como fuente de verdad: cualquier valor
+    enviado en ``subtotal``, ``tax_amount`` o ``total`` se sobrescribe.
     """
 
-    code: str = Field(
+    code: str | None = Field(
+        default=None,
         min_length=1,
         max_length=30,
-        description="Código único del pedido (por ejemplo, PED-2026-0001).",
+        description=(
+            "Código único del pedido. Si se omite, el servicio genera uno "
+            "secuencial con formato PED-YYYY-XXXX."
+        ),
         examples=["PED-2026-0001"],
     )
     customer_id: int = Field(gt=0, description="Cliente que realiza el pedido.")
@@ -294,6 +300,45 @@ class SalesOrderCreate(SalesSchema):
             sum((item.tax_amount for item in self.items), Decimal("0.00"))
         )
         self.total = _money(self.subtotal + self.tax_amount)
+        return self
+
+
+class SalesOrderUpdate(SalesSchema):
+    """Edición parcial de una cotización o pedido aún editable.
+
+    El servicio solo admite cambios mientras el pedido esté en ``DRAFT`` o
+    ``QUOTATION``. Si se envían ``items``, reemplazan por completo a las líneas
+    anteriores y los totales se recalculan; el ``code`` no se puede modificar.
+    """
+
+    customer_id: int | None = Field(
+        default=None, gt=0, description="Cliente que realiza el pedido."
+    )
+    status: SalesOrderStatus | None = Field(
+        default=None,
+        description="Nuevo estado; solo se admiten DRAFT o QUOTATION.",
+    )
+    issue_date: date | None = Field(
+        default=None, description="Nueva fecha de emisión."
+    )
+    valid_until: date | None = Field(
+        default=None, description="Nueva fecha de expiración (opcional)."
+    )
+    items: list[SalesOrderItemCreate] | None = Field(
+        default=None,
+        min_length=1,
+        description="Líneas de reemplazo; al menos una si se envían.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_patch(self) -> Self:
+        if not self.model_fields_set:
+            raise ValueError("Debe enviar al menos un campo para actualizar")
+
+        nullable = {"valid_until"}
+        for field in self.model_fields_set - nullable:
+            if getattr(self, field) is None:
+                raise ValueError(f"El campo '{field}' no puede ser nulo")
         return self
 
 
