@@ -787,6 +787,21 @@ def test_invoice_cycle_immutability_payments_and_credit_note(
     )
     assert payment_on_paid.status_code == 409, payment_on_paid.text
 
+    # El historial conserva cada abono, incluido el pago total.
+    payments = client.get(
+        f"{SALES_URL}/invoices/{invoice_id}/payments",
+        headers=sales_headers,
+    )
+    assert payments.status_code == 200, payments.text
+    assert [
+        (item["invoice_id"], Decimal(item["amount"]))
+        for item in payments.json()
+    ] == [
+        (invoice_id, Decimal("400.00")),
+        (invoice_id, Decimal("790.00")),
+    ]
+    assert payments.json()[0]["paid_at"] == str(_TODAY)
+
     # Nota crédito: contrapartida sin modificar la factura original.
     note = client.post(
         f"{SALES_URL}/invoices/{invoice_id}/credit-notes",

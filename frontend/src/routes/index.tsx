@@ -5,11 +5,13 @@ import InventoryPage from "../modules/inventory/InventoryPage";
 import ProductList from "../modules/inventory/ProductList";
 import WarehouseList from "../modules/inventory/WarehouseList";
 import CustomerList from "../modules/sales/CustomerList";
+import InvoiceDetail from "../modules/sales/InvoiceDetail";
+import InvoiceList from "../modules/sales/InvoiceList";
 import SalesOrderList from "../modules/sales/SalesOrderList";
 import LoginPage from "../modules/users/LoginPage";
 import UserList from "../modules/users/UserList";
 import AccessDenied from "./AccessDenied";
-import { IndexRedirect, RequireAuth, RequireModule } from "./guards";
+import { IndexRedirect, RequireAuth, RequireModule, RequireRole } from "./guards";
 import ModulePlaceholder from "./ModulePlaceholder";
 
 export const router = createBrowserRouter([
@@ -44,11 +46,26 @@ export const router = createBrowserRouter([
             element: <RequireModule module="sales" />,
             children: [
               {
-                path: "sales",
-                element: <Navigate to="/sales/customers" replace />,
+                element: (
+                  <RequireRole
+                    roles={["sales", "administrator"]}
+                    module="sales"
+                  />
+                ),
+                children: [
+                  {
+                    path: "sales",
+                    element: <Navigate to="/sales/customers" replace />,
+                  },
+                  { path: "sales/customers", element: <CustomerList /> },
+                  { path: "sales/orders", element: <SalesOrderList /> },
+                  { path: "sales/invoices", element: <InvoiceList /> },
+                  {
+                    path: "sales/invoices/:invoiceId",
+                    element: <InvoiceDetail />,
+                  },
+                ],
               },
-              { path: "sales/customers", element: <CustomerList /> },
-              { path: "sales/orders", element: <SalesOrderList /> },
             ],
           },
           {

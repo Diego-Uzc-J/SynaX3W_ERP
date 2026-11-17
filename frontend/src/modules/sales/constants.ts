@@ -24,6 +24,12 @@ export const INVOICE_STATUS_LABELS: Record<InvoiceStatus, string> = {
   VOID: "Anulada",
 };
 
+export const INVOICE_STATUS_HINTS: Record<InvoiceStatus, string> = {
+  ISSUED: "Emitida; admite abonos y notas crédito mientras tenga saldo.",
+  PAID: "Pagada; solo admite notas crédito.",
+  VOID: "Anulada; no admite pagos ni notas crédito.",
+};
+
 export type BadgeTone = "neutral" | "warning" | "success" | "strong" | "muted";
 
 export const ORDER_STATUS_TONES: Record<SalesOrderStatus, BadgeTone> = {

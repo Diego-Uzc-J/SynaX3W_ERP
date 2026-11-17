@@ -104,6 +104,11 @@ export const SALES_LINKS = [
     label: "Pedidos",
     description: "Cotizaciones y facturación",
   },
+  {
+    to: "/sales/invoices",
+    label: "Facturas",
+    description: "Cobros, abonos y notas",
+  },
 ] as const;
 
 export function moduleByKey(key: ModuleKey): ModuleDefinition {

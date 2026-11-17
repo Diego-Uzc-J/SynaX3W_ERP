@@ -1,7 +1,8 @@
 """Modelos de dominio del módulo de Ventas y Facturación.
 
 Implementa las entidades descritas en ``specs/sales_spec.md`` (sección 2):
-``Customer``, ``SalesOrder``, ``SalesOrderItem``, ``Invoice`` y ``CreditNote``.
+``Customer``, ``SalesOrder``, ``SalesOrderItem``, ``Invoice``,
+``InvoicePayment`` y ``CreditNote``.
 
 Convenciones alineadas con el resto del ERP:
 
@@ -267,9 +268,48 @@ class Invoice(Base):
     sales_order: Mapped[SalesOrder | None] = relationship(back_populates="invoices")
     customer: Mapped[Customer] = relationship(back_populates="invoices")
     credit_notes: Mapped[list[CreditNote]] = relationship(back_populates="invoice")
+    payments: Mapped[list[InvoicePayment]] = relationship(back_populates="invoice")
 
     def __repr__(self) -> str:  # pragma: no cover - ayuda de depuración
         return f"<Invoice id={self.id!r} code={self.code!r} status={self.status!r}>"
+
+
+class InvoicePayment(Base):
+    """Abono parcial o total aplicado a una factura emitida.
+
+    Materializa el historial que respalda ``Invoice.balance_due``: cada pago
+    se registra como un documento inmutable en la misma transacción que
+    actualiza el saldo, de modo que la factura puede auditarse sin depender
+    de un saldo calculado. ``ON DELETE RESTRICT`` preserva el historial.
+    """
+
+    __tablename__ = "invoice_payments"
+    __table_args__ = (
+        CheckConstraint(
+            "amount > 0", name="ck_invoice_payments_amount_positive"
+        ),
+        Index("ix_invoice_payments_invoice_id", "invoice_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    invoice_id: Mapped[int] = mapped_column(
+        ForeignKey("invoices.id", ondelete="RESTRICT"), nullable=False
+    )
+    amount: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    paid_at: Mapped[date] = mapped_column(
+        Date, nullable=False, default=date.today, server_default=func.current_date()
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    invoice: Mapped[Invoice] = relationship(back_populates="payments")
+
+    def __repr__(self) -> str:  # pragma: no cover - ayuda de depuración
+        return (
+            f"<InvoicePayment id={self.id!r} invoice_id={self.invoice_id!r} "
+            f"amount={self.amount!r}>"
+        )
 
 
 class CreditNote(Base):

@@ -151,6 +151,37 @@ export interface InvoiceCreate {
   total?: number | string | null;
 }
 
+export interface InvoicePayment {
+  id: number;
+  invoice_id: number;
+  /** Decimal serializado como string por Pydantic. */
+  amount: string;
+  paid_at: string;
+  created_at: string;
+}
+
+export interface InvoicePaymentCreate {
+  amount: number | string;
+}
+
+export interface CreditNote {
+  id: number;
+  code: string;
+  invoice_id: number;
+  amount: string;
+  reason: string | null;
+  issue_date: string;
+  created_at: string;
+}
+
+export interface CreditNoteCreate {
+  code?: string;
+  invoice_id?: number;
+  amount: number | string;
+  reason?: string | null;
+  issue_date?: string;
+}
+
 // --------------------------------------------------------------------------- //
 // Filtros y paginación
 // --------------------------------------------------------------------------- //
@@ -284,6 +315,47 @@ export function issueInvoice(payload: InvoiceCreate): Promise<Invoice> {
   });
 }
 
+export function getInvoice(invoiceId: number): Promise<Invoice> {
+  return apiRequest<Invoice>(`${SALES_PATH}/invoices/${invoiceId}`);
+}
+
+export function registerInvoicePayment(
+  invoiceId: number,
+  payload: InvoicePaymentCreate,
+): Promise<Invoice> {
+  return apiRequest<Invoice>(`${SALES_PATH}/invoices/${invoiceId}/pay`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function listInvoicePayments(
+  invoiceId: number,
+): Promise<InvoicePayment[]> {
+  return apiRequest<InvoicePayment[]>(
+    `${SALES_PATH}/invoices/${invoiceId}/payments`,
+  );
+}
+
+export function listCreditNotes(invoiceId: number): Promise<CreditNote[]> {
+  return apiRequest<CreditNote[]>(
+    `${SALES_PATH}/invoices/${invoiceId}/credit-notes`,
+  );
+}
+
+export function issueCreditNote(
+  invoiceId: number,
+  payload: CreditNoteCreate,
+): Promise<CreditNote> {
+  return apiRequest<CreditNote>(
+    `${SALES_PATH}/invoices/${invoiceId}/credit-notes`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
 // --------------------------------------------------------------------------- //
 // Claves de caché de TanStack Query
 // --------------------------------------------------------------------------- //
@@ -306,6 +378,12 @@ export const salesKeys = {
     all: ["sales", "invoices"] as const,
     list: (filters: InvoiceFilters) =>
       ["sales", "invoices", "list", filters] as const,
+    detail: (invoiceId: number) =>
+      ["sales", "invoices", "detail", invoiceId] as const,
+    payments: (invoiceId: number) =>
+      ["sales", "invoices", "payments", invoiceId] as const,
+    creditNotes: (invoiceId: number) =>
+      ["sales", "invoices", "credit-notes", invoiceId] as const,
   },
 } as const;
 
@@ -458,6 +536,78 @@ export function useIssueInvoice() {
     mutationFn: issueInvoice,
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: salesKeys.invoices.all });
+    },
+  });
+}
+
+/** Detalle de factura; `enabled` evita consultar identificadores inválidos. */
+export function useInvoice(invoiceId: number, enabled = true) {
+  return useQuery({
+    queryKey: salesKeys.invoices.detail(invoiceId),
+    queryFn: () => getInvoice(invoiceId),
+    enabled: enabled && invoiceId > 0,
+  });
+}
+
+export interface RegisterPaymentVariables {
+  invoiceId: number;
+  payload: InvoicePaymentCreate;
+}
+
+/** Registra un abono y refresca la factura, el listado y su historial. */
+export function useRegisterInvoicePayment() {
+  const queryClient = useQueryClient();
+  return useMutation<Invoice, Error, RegisterPaymentVariables>({
+    mutationFn: ({ invoiceId, payload }) =>
+      registerInvoicePayment(invoiceId, payload),
+    onSuccess: (invoice) => {
+      queryClient.setQueryData(
+        salesKeys.invoices.detail(invoice.id),
+        invoice,
+      );
+      void queryClient.invalidateQueries({ queryKey: salesKeys.invoices.all });
+      void queryClient.invalidateQueries({
+        queryKey: salesKeys.invoices.payments(invoice.id),
+      });
+    },
+  });
+}
+
+export function useInvoicePayments(invoiceId: number, enabled = true) {
+  return useQuery({
+    queryKey: salesKeys.invoices.payments(invoiceId),
+    queryFn: () => listInvoicePayments(invoiceId),
+    enabled: enabled && invoiceId > 0,
+  });
+}
+
+export function useCreditNotes(invoiceId: number, enabled = true) {
+  return useQuery({
+    queryKey: salesKeys.invoices.creditNotes(invoiceId),
+    queryFn: () => listCreditNotes(invoiceId),
+    enabled: enabled && invoiceId > 0,
+  });
+}
+
+export interface IssueCreditNoteVariables {
+  invoiceId: number;
+  payload: CreditNoteCreate;
+}
+
+/** Emite una nota crédito e invalida la factura y sus contrapartidas. */
+export function useIssueCreditNote() {
+  const queryClient = useQueryClient();
+  return useMutation<CreditNote, Error, IssueCreditNoteVariables>({
+    mutationFn: ({ invoiceId, payload }) =>
+      issueCreditNote(invoiceId, payload),
+    onSuccess: (note) => {
+      void queryClient.invalidateQueries({ queryKey: salesKeys.invoices.all });
+      void queryClient.invalidateQueries({
+        queryKey: salesKeys.invoices.detail(note.invoice_id),
+      });
+      void queryClient.invalidateQueries({
+        queryKey: salesKeys.invoices.creditNotes(note.invoice_id),
+      });
     },
   });
 }

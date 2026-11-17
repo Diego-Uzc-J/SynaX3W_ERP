@@ -3,6 +3,7 @@ import { NavLink } from "react-router-dom";
 const TABS = [
   { to: "/sales/customers", label: "Clientes" },
   { to: "/sales/orders", label: "Pedidos y cotizaciones" },
+  { to: "/sales/invoices", label: "Facturas" },
 ] as const;
 
 /** Navegación secundaria común a las vistas del módulo de ventas. */

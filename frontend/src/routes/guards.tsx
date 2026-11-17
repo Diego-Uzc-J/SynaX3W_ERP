@@ -9,6 +9,7 @@ import {
   setUser,
   useAuth,
 } from "../store/authStore";
+import type { RoleName } from "../store/authStore";
 import AccessDenied from "./AccessDenied";
 import { firstAccessiblePath } from "./modules";
 import type { ModuleKey } from "./modules";
@@ -82,6 +83,31 @@ export function RequireModule({ module }: { module: ModuleKey }) {
     return <Navigate to="/login" replace />;
   }
   if (!hasModuleAccess(user, module)) {
+    return <AccessDenied module={module} />;
+  }
+  return <Outlet />;
+}
+
+/**
+ * Exige un rol concreto, con el mismo bypass de administrador que el backend.
+ *
+ * `RequireModule` solo valida `allowed_modules`; algunas combinaciones (por
+ * ejemplo un rol contable con `sales:read`) abrirían la ruta y el backend la
+ * rechazaría con 403. Este guardia alinea la navegación con `require_roles`.
+ */
+export function RequireRole({
+  roles,
+  module = null,
+}: {
+  roles: readonly RoleName[];
+  module?: ModuleKey | null;
+}) {
+  const { user } = useAuth();
+
+  if (user === null) {
+    return <Navigate to="/login" replace />;
+  }
+  if (user.role.name !== "administrator" && !roles.includes(user.role.name)) {
     return <AccessDenied module={module} />;
   }
   return <Outlet />;

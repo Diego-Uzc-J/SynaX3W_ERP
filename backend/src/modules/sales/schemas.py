@@ -37,6 +37,7 @@ __all__ = [
     "CustomerUpdate",
     "InvoiceCreate",
     "InvoicePaymentCreate",
+    "InvoicePaymentResponse",
     "InvoiceResponse",
     "InvoiceStatus",
     "SalesOrderCreate",
@@ -455,6 +456,16 @@ class InvoicePaymentCreate(SalesSchema):
         description="Importe del pago; debe ser mayor que cero.",
         examples=["400.00"],
     )
+
+
+class InvoicePaymentResponse(SalesResponseSchema):
+    """Abono registrado en el historial de una factura."""
+
+    id: int
+    invoice_id: int
+    amount: Decimal
+    paid_at: date
+    created_at: datetime
 
 
 class InvoiceResponse(SalesResponseSchema):

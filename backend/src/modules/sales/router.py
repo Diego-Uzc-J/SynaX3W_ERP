@@ -29,6 +29,7 @@ from src.modules.sales.schemas import (
     CustomerUpdate,
     InvoiceCreate,
     InvoicePaymentCreate,
+    InvoicePaymentResponse,
     InvoiceResponse,
     SalesOrderCancelRequest,
     SalesOrderConfirmRequest,
@@ -388,6 +389,27 @@ def pay_invoice(
     """Aplica un pago parcial o total y actualiza ``balance_due``/``PAID``."""
     invoice = services.register_invoice_payment(db, invoice_id, payload)
     return InvoiceResponse.model_validate(invoice)
+
+
+@invoices_router.get(
+    "/{invoice_id}/payments",
+    response_model=list[InvoicePaymentResponse],
+    status_code=status.HTTP_200_OK,
+    summary="Listar el historial de pagos de una factura",
+    dependencies=[Depends(require_sales)],
+)
+def list_invoice_payments(
+    invoice_id: int = Path(gt=0),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=200),
+    db: Session = Depends(get_db),
+) -> list[InvoicePaymentResponse]:
+    """Devuelve los abonos registrados, del más antiguo al más reciente."""
+    services.get_invoice(db, invoice_id)
+    payments = services.list_invoice_payments(
+        db, invoice_id=invoice_id, skip=skip, limit=limit
+    )
+    return [InvoicePaymentResponse.model_validate(payment) for payment in payments]
 
 
 @invoices_router.post(

@@ -40,6 +40,7 @@ from src.modules.sales.models import (
     CreditNote,
     Customer,
     Invoice,
+    InvoicePayment,
     InvoiceStatus,
     SalesOrder,
     SalesOrderItem,
@@ -81,6 +82,7 @@ __all__ = [
     "issue_invoice",
     "list_credit_notes",
     "list_customers",
+    "list_invoice_payments",
     "list_invoices",
     "list_sales_orders",
     "register_invoice_payment",
@@ -1065,6 +1067,24 @@ def list_invoices(
     return list(db.scalars(stmt).all())
 
 
+def list_invoice_payments(
+    db: Session,
+    *,
+    invoice_id: int,
+    skip: int = 0,
+    limit: int = 100,
+) -> list[InvoicePayment]:
+    """Lista los abonos de una factura en orden cronológico."""
+    stmt = (
+        select(InvoicePayment)
+        .where(InvoicePayment.invoice_id == invoice_id)
+        .order_by(InvoicePayment.created_at, InvoicePayment.id)
+        .offset(skip)
+        .limit(limit)
+    )
+    return list(db.scalars(stmt).all())
+
+
 def issue_invoice(db: Session, data: InvoiceCreate) -> Invoice:
     """Emite una factura ``ISSUED`` desde un pedido o como venta directa.
 
@@ -1154,7 +1174,8 @@ def register_invoice_payment(
 
     El importe se descuenta de ``balance_due``; cuando llega a cero la factura
     pasa a ``PAID``. No se admiten sobrepagos ni pagos sobre facturas ``PAID``
-    o ``VOID``. El pago y el nuevo saldo se confirman en un único ``COMMIT``.
+    o ``VOID``. El abono queda en el historial ``invoice_payments`` y el nuevo
+    saldo se confirma en un único ``COMMIT``.
     """
     invoice = get_invoice(db, invoice_id, for_update=True)
 
@@ -1186,6 +1207,14 @@ def register_invoice_payment(
     invoice.balance_due = _money(balance - amount)
     if invoice.balance_due == 0:
         invoice.status = InvoiceStatus.PAID
+
+    db.add(
+        InvoicePayment(
+            invoice_id=invoice.id,
+            amount=amount,
+            paid_at=date.today(),
+        )
+    )
 
     _commit(
         db,
