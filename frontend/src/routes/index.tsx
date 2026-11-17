@@ -4,6 +4,8 @@ import AppLayout from "../layouts/AppLayout";
 import InventoryPage from "../modules/inventory/InventoryPage";
 import ProductList from "../modules/inventory/ProductList";
 import WarehouseList from "../modules/inventory/WarehouseList";
+import CustomerList from "../modules/sales/CustomerList";
+import SalesOrderList from "../modules/sales/SalesOrderList";
 import LoginPage from "../modules/users/LoginPage";
 import UserList from "../modules/users/UserList";
 import AccessDenied from "./AccessDenied";
@@ -43,8 +45,10 @@ export const router = createBrowserRouter([
             children: [
               {
                 path: "sales",
-                element: <ModulePlaceholder module="sales" />,
+                element: <Navigate to="/sales/customers" replace />,
               },
+              { path: "sales/customers", element: <CustomerList /> },
+              { path: "sales/orders", element: <SalesOrderList /> },
             ],
           },
           {

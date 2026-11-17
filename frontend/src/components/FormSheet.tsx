@@ -8,6 +8,12 @@ interface FormSheetProps {
   submitLabel: string;
   pendingLabel: string;
   isPending: boolean;
+  /** Deshabilita el envío por una precondición de negocio, no por carga. */
+  submitDisabled?: boolean;
+  /** Texto del botón de cierre; por defecto "Cancelar". */
+  closeLabel?: string;
+  /** `lg` amplía el panel para formularios con líneas de detalle. */
+  size?: "md" | "lg";
   onClose: () => void;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void;
   children: ReactNode;
@@ -26,6 +32,9 @@ export default function FormSheet({
   submitLabel,
   pendingLabel,
   isPending,
+  submitDisabled = false,
+  closeLabel = "Cancelar",
+  size = "md",
   onClose,
   onSubmit,
   children,
@@ -68,7 +77,12 @@ export default function FormSheet({
         onClick={onClose}
       />
 
-      <div className="sheet-enter relative flex h-full w-full max-w-lg flex-col bg-concrete-50 shadow-2xl">
+      <div
+        className={[
+          "sheet-enter relative flex h-full w-full flex-col bg-concrete-50 shadow-2xl",
+          size === "lg" ? "max-w-3xl" : "max-w-lg",
+        ].join(" ")}
+      >
         <form
           onSubmit={onSubmit}
           noValidate
@@ -103,11 +117,11 @@ export default function FormSheet({
               onClick={onClose}
               className="border border-concrete-200 px-4 py-2 text-sm font-semibold text-ink-700 hover:border-ink-500 hover:text-ink-950"
             >
-              Cancelar
+              {closeLabel}
             </button>
             <button
               type="submit"
-              disabled={isPending}
+              disabled={isPending || submitDisabled}
               className="bg-signal-500 px-4 py-2 text-sm font-semibold text-white transition-colors hover:bg-signal-600 disabled:cursor-not-allowed disabled:opacity-60"
             >
               {isPending ? pendingLabel : submitLabel}

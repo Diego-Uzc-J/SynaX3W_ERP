@@ -1,7 +1,11 @@
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
 
 import { initials, ROLE_LABELS } from "../modules/users/constants";
-import { accessibleModules, INVENTORY_LINKS } from "../routes/modules";
+import {
+  accessibleModules,
+  INVENTORY_LINKS,
+  SALES_LINKS,
+} from "../routes/modules";
 import { canWriteModule, logout, useAuth } from "../store/authStore";
 
 const navItemClass = (isActive: boolean): string =>
@@ -34,9 +38,13 @@ export default function AppLayout() {
 
   const modules = user === null ? [] : accessibleModules(user);
   const inventory = modules.find((module) => module.key === "inventory");
+  const sales = modules.find((module) => module.key === "sales");
   const users = modules.find((module) => module.key === "users");
   const otherModules = modules.filter(
-    (module) => module.key !== "inventory" && module.key !== "users",
+    (module) =>
+      module.key !== "inventory" &&
+      module.key !== "sales" &&
+      module.key !== "users",
   );
   const isInventoryReadOnly =
     user !== null && !canWriteModule(user, "inventory");
@@ -45,6 +53,9 @@ export default function AppLayout() {
     ...(inventory === undefined
       ? []
       : INVENTORY_LINKS.map((link) => ({ to: link.to, label: link.label }))),
+    ...(sales === undefined
+      ? []
+      : SALES_LINKS.map((link) => ({ to: link.to, label: link.label }))),
     ...otherModules.map((module) => ({
       to: module.path,
       label: module.label,
@@ -100,6 +111,27 @@ export default function AppLayout() {
                     escritura están reservadas a inventario.
                   </p>
                 ) : null}
+              </>
+            )}
+
+            {sales === undefined ? null : (
+              <>
+                <SectionLabel>{sales.label}</SectionLabel>
+                {SALES_LINKS.map((item) => (
+                  <NavLink
+                    key={item.to}
+                    to={item.to}
+                    end
+                    className={({ isActive }) => navItemClass(isActive)}
+                  >
+                    <span className="block text-sm font-semibold lg:text-[0.8125rem]">
+                      {item.label}
+                    </span>
+                    <span className="hidden text-xs text-concrete-400 lg:block">
+                      {item.description}
+                    </span>
+                  </NavLink>
+                ))}
               </>
             )}
 

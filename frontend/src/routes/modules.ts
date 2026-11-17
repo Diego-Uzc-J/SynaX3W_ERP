@@ -36,7 +36,7 @@ export const MODULES: readonly ModuleDefinition[] = [
     label: "Ventas",
     description: "Pedidos y facturación de venta",
     path: "/sales",
-    implemented: false,
+    implemented: true,
   },
   {
     key: "purchasing",
@@ -90,6 +90,19 @@ export const INVENTORY_LINKS = [
     to: "/inventory/warehouses",
     label: "Bodegas",
     description: "Almacenes físicos",
+  },
+] as const;
+
+export const SALES_LINKS = [
+  {
+    to: "/sales/customers",
+    label: "Clientes",
+    description: "Cartera y límites de crédito",
+  },
+  {
+    to: "/sales/orders",
+    label: "Pedidos",
+    description: "Cotizaciones y facturación",
   },
 ] as const;
 
