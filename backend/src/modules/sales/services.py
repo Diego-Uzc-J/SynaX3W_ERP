@@ -37,6 +37,7 @@ from src.modules.inventory.models import (
 )
 from src.modules.inventory.schemas import StockMovementCreate
 from src.modules.sales.models import (
+    CreditNote,
     Customer,
     Invoice,
     InvoiceStatus,
@@ -45,8 +46,11 @@ from src.modules.sales.models import (
     SalesOrderStatus,
 )
 from src.modules.sales.schemas import (
+    CreditNoteCreate,
     CustomerCreate,
     CustomerUpdate,
+    InvoiceCreate,
+    InvoicePaymentCreate,
     SalesOrderCreate,
     SalesOrderItemCreate,
     SalesOrderUpdate,
@@ -55,6 +59,7 @@ from src.modules.sales.schemas import (
 __all__ = [
     "CreditLimitExceededError",
     "DuplicateResourceError",
+    "ImmutableInvoiceError",
     "InactiveCustomerError",
     "InsufficientStockForOrderError",
     "InvalidOrderDataError",
@@ -69,13 +74,21 @@ __all__ = [
     "ensure_credit_available",
     "get_available_credit",
     "get_customer",
+    "get_invoice",
     "get_pending_balance",
     "get_sales_order",
+    "issue_credit_note",
+    "issue_invoice",
+    "list_credit_notes",
     "list_customers",
+    "list_invoices",
     "list_sales_orders",
+    "register_invoice_payment",
+    "reject_invoice_mutation",
     "update_customer",
     "update_sales_order",
     "validate_order_credit",
+    "void_invoice",
 ]
 
 #: Unidad mínima de los importes monetarios del ERP.
@@ -91,6 +104,17 @@ _EDITABLE_STATUSES = frozenset(
 
 #: Clave base del advisory lock que serializa la secuencia de códigos.
 _ORDER_CODE_LOCK_BASE = 7_500_000
+
+#: Clave base del advisory lock de la secuencia ``FAC-YYYY-XXXX``.
+_INVOICE_CODE_LOCK_BASE = 7_600_000
+
+#: Clave base del advisory lock de la secuencia ``NC-YYYY-XXXX``.
+_CREDIT_NOTE_CODE_LOCK_BASE = 7_700_000
+
+#: Estados del pedido que habilitan la emisión de una factura.
+_INVOICED_ORDER_STATUSES = frozenset(
+    {SalesOrderStatus.CONFIRMED, SalesOrderStatus.FULFILLED}
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -130,6 +154,16 @@ class InvalidOrderStateError(SalesServiceError):
 
 class InvalidOrderDataError(SalesServiceError):
     """Los datos del pedido no cumplen una regla de negocio."""
+
+    status_code = 400
+
+
+class ImmutableInvoiceError(SalesServiceError):
+    """Se intentó editar o eliminar una factura emitida.
+
+    La regla 3 y el escenario 4 de ``specs/sales_spec.md`` exigen responder
+    400 y corregir mediante anulación (``VOID``) o nota crédito.
+    """
 
     status_code = 400
 
@@ -250,6 +284,32 @@ def _ensure_unique_order_code(
         )
 
 
+def _ensure_unique_invoice_code(
+    db: Session, code: str, *, exclude_id: int | None = None
+) -> None:
+    """Verifica que el código de factura no esté en uso."""
+    stmt = select(Invoice.id).where(Invoice.code == code)
+    if exclude_id is not None:
+        stmt = stmt.where(Invoice.id != exclude_id)
+    if db.execute(stmt.limit(1)).first() is not None:
+        raise DuplicateResourceError(
+            f"Ya existe una factura con el código '{code}'"
+        )
+
+
+def _ensure_unique_credit_note_code(
+    db: Session, code: str, *, exclude_id: int | None = None
+) -> None:
+    """Verifica que el código de nota crédito no esté en uso."""
+    stmt = select(CreditNote.id).where(CreditNote.code == code)
+    if exclude_id is not None:
+        stmt = stmt.where(CreditNote.id != exclude_id)
+    if db.execute(stmt.limit(1)).first() is not None:
+        raise DuplicateResourceError(
+            f"Ya existe una nota crédito con el código '{code}'"
+        )
+
+
 def _get_customer(db: Session, customer_id: int) -> Customer:
     """Obtiene un cliente por id, sin importar su estado."""
     customer = db.get(Customer, customer_id)
@@ -353,25 +413,20 @@ def _recalculate_totals(
     return subtotal, tax_amount, total
 
 
-def _lock_order_sequence(db: Session, year: int) -> None:
+def _lock_sequence(db: Session, *, base: int, year: int) -> None:
     """Serializa la generación de códigos en PostgreSQL.
 
     El advisory lock se libera al terminar la transacción. En SQLite (pruebas)
-    no aplica y la unicidad queda garantizada por el índice de ``code``.
+    no aplica y la unicidad queda garantizada por el índice único de ``code``.
     """
     bind = db.get_bind()
     if bind.dialect.name == "postgresql":
-        db.execute(
-            select(func.pg_advisory_xact_lock(_ORDER_CODE_LOCK_BASE + year))
-        )
+        db.execute(select(func.pg_advisory_xact_lock(base + year)))
 
 
-def _next_order_code(db: Session, year: int) -> str:
-    """Devuelve el siguiente código ``PED-YYYY-XXXX`` para el año indicado."""
-    prefix = f"PED-{year}-"
-    rows = db.scalars(
-        select(SalesOrder.code).where(SalesOrder.code.like(f"{prefix}%"))
-    ).all()
+def _next_sequence(db: Session, column: Any, *, prefix: str) -> str:
+    """Devuelve el siguiente código ``PREFIJO-XXXX`` para la columna dada."""
+    rows = db.scalars(select(column).where(column.like(f"{prefix}%"))).all()
 
     max_sequence = 0
     for code in rows:
@@ -379,6 +434,36 @@ def _next_order_code(db: Session, year: int) -> str:
         if suffix.isdigit():
             max_sequence = max(max_sequence, int(suffix))
     return f"{prefix}{max_sequence + 1:04d}"
+
+
+def _lock_order_sequence(db: Session, year: int) -> None:
+    """Serializa la secuencia de códigos de pedido del año."""
+    _lock_sequence(db, base=_ORDER_CODE_LOCK_BASE, year=year)
+
+
+def _next_order_code(db: Session, year: int) -> str:
+    """Devuelve el siguiente código ``PED-YYYY-XXXX`` para el año indicado."""
+    return _next_sequence(db, SalesOrder.code, prefix=f"PED-{year}-")
+
+
+def _lock_invoice_sequence(db: Session, year: int) -> None:
+    """Serializa la secuencia de códigos de factura del año."""
+    _lock_sequence(db, base=_INVOICE_CODE_LOCK_BASE, year=year)
+
+
+def _next_invoice_code(db: Session, year: int) -> str:
+    """Devuelve el siguiente código ``FAC-YYYY-XXXX`` para el año indicado."""
+    return _next_sequence(db, Invoice.code, prefix=f"FAC-{year}-")
+
+
+def _lock_credit_note_sequence(db: Session, year: int) -> None:
+    """Serializa la secuencia de códigos de nota crédito del año."""
+    _lock_sequence(db, base=_CREDIT_NOTE_CODE_LOCK_BASE, year=year)
+
+
+def _next_credit_note_code(db: Session, year: int) -> str:
+    """Devuelve el siguiente código ``NC-YYYY-XXXX`` para el año indicado."""
+    return _next_sequence(db, CreditNote.code, prefix=f"NC-{year}-")
 
 
 def _resolve_dispatch_warehouse(
@@ -467,6 +552,23 @@ def _register_outbound(
 def _order_has_invoices(db: Session, order_id: int) -> bool:
     """Indica si el pedido ya tiene algún documento fiscal asociado."""
     stmt = select(Invoice.id).where(Invoice.sales_order_id == order_id).limit(1)
+    return db.execute(stmt).first() is not None
+
+
+def _order_has_active_invoice(
+    db: Session, order_id: int, *, exclude_id: int | None = None
+) -> bool:
+    """Indica si el pedido tiene una factura vigente (no anulada)."""
+    stmt = (
+        select(Invoice.id)
+        .where(
+            Invoice.sales_order_id == order_id,
+            Invoice.status != InvoiceStatus.VOID,
+        )
+        .limit(1)
+    )
+    if exclude_id is not None:
+        stmt = stmt.where(Invoice.id != exclude_id)
     return db.execute(stmt).first() is not None
 
 
@@ -915,6 +1017,339 @@ def cancel_sales_order(
 
     db.refresh(order)
     return order
+
+
+# --------------------------------------------------------------------------- #
+# Facturación y notas crédito
+# --------------------------------------------------------------------------- #
+
+
+def get_invoice(
+    db: Session, invoice_id: int, *, for_update: bool = False
+) -> Invoice:
+    """Obtiene una factura o lanza ``ResourceNotFoundError``.
+
+    ``for_update=True`` serializa pagos, anulaciones y notas crédito sobre la
+    misma factura.
+    """
+    stmt = select(Invoice).where(Invoice.id == invoice_id)
+    if for_update:
+        stmt = stmt.with_for_update()
+    invoice = db.scalars(stmt).first()
+    if invoice is None:
+        raise ResourceNotFoundError(f"Factura {invoice_id} no encontrada")
+    return invoice
+
+
+def list_invoices(
+    db: Session,
+    *,
+    skip: int = 0,
+    limit: int = 100,
+    status: InvoiceStatus | None = None,
+    customer_id: int | None = None,
+    sales_order_id: int | None = None,
+    code: str | None = None,
+) -> list[Invoice]:
+    """Lista facturas con filtros por estado, cliente, pedido o código."""
+    stmt = select(Invoice)
+    if status is not None:
+        stmt = stmt.where(Invoice.status == status)
+    if customer_id is not None:
+        stmt = stmt.where(Invoice.customer_id == customer_id)
+    if sales_order_id is not None:
+        stmt = stmt.where(Invoice.sales_order_id == sales_order_id)
+    if code:
+        stmt = stmt.where(Invoice.code.ilike(f"%{code}%"))
+    stmt = stmt.order_by(Invoice.id).offset(skip).limit(limit)
+    return list(db.scalars(stmt).all())
+
+
+def issue_invoice(db: Session, data: InvoiceCreate) -> Invoice:
+    """Emite una factura ``ISSUED`` desde un pedido o como venta directa.
+
+    - Con ``sales_order_id`` el pedido debe estar ``CONFIRMED`` o ``FULFILLED``,
+      pertenecer al mismo cliente y no tener otra factura vigente. El total se
+      toma del pedido y no puede contradecirse en la petición.
+    - Sin pedido (venta directa) el total es obligatorio y se valida contra el
+      crédito disponible del cliente, porque no hubo confirmación previa.
+    - El código se genera como ``FAC-YYYY-XXXX`` si no se envía uno explícito.
+    - ``balance_due`` nace igual al total; la factura es inmutable desde este
+      momento salvo por pagos, anulación o notas crédito.
+    """
+    if data.due_date < data.issue_date:
+        raise InvalidOrderDataError(
+            "La fecha límite de pago no puede ser anterior a la emisión"
+        )
+
+    _get_active_customer(db, data.customer_id)
+
+    if data.sales_order_id is not None:
+        order = get_sales_order(db, data.sales_order_id, for_update=True)
+        if order.customer_id != data.customer_id:
+            raise InvalidOrderDataError(
+                f"El pedido '{order.code}' pertenece al cliente "
+                f"{order.customer_id}, no al cliente {data.customer_id}"
+            )
+        if order.status not in _INVOICED_ORDER_STATUSES:
+            raise InvalidOrderStateError(
+                f"El pedido '{order.code}' está en estado {order.status.value} "
+                "y solo puede facturarse si está CONFIRMED o FULFILLED"
+            )
+        if _order_has_active_invoice(db, order.id):
+            raise DuplicateResourceError(
+                f"El pedido '{order.code}' ya tiene una factura vigente"
+            )
+
+        total = _money(order.total)
+        if data.total is not None and _money(data.total) != total:
+            raise InvalidOrderDataError(
+                f"El total enviado ({_money(data.total)}) no coincide con el "
+                f"total del pedido '{order.code}' ({total})"
+            )
+    else:
+        # Venta directa: no existe la validación previa de la confirmación.
+        if data.total is None:
+            raise InvalidOrderDataError(
+                "Una factura directa requiere el campo 'total'"
+            )
+        total = _money(data.total)
+        if total <= 0:
+            raise InvalidOrderDataError(
+                "El total de una factura directa debe ser mayor que cero"
+            )
+        ensure_credit_available(db, data.customer_id, total)
+
+    if data.code is None:
+        _lock_invoice_sequence(db, data.issue_date.year)
+        code = _next_invoice_code(db, data.issue_date.year)
+    else:
+        code = data.code
+        _ensure_unique_invoice_code(db, code)
+
+    invoice = Invoice(
+        code=code,
+        sales_order_id=data.sales_order_id,
+        customer_id=data.customer_id,
+        status=InvoiceStatus.ISSUED,
+        issue_date=data.issue_date,
+        due_date=data.due_date,
+        total=total,
+        balance_due=total,
+    )
+    db.add(invoice)
+
+    _commit(
+        db,
+        duplicate_message=f"Ya existe una factura con el código '{code}'",
+    )
+    db.refresh(invoice)
+    return invoice
+
+
+def register_invoice_payment(
+    db: Session, invoice_id: int, data: InvoicePaymentCreate
+) -> Invoice:
+    """Registra un pago parcial o total sobre una factura ``ISSUED``.
+
+    El importe se descuenta de ``balance_due``; cuando llega a cero la factura
+    pasa a ``PAID``. No se admiten sobrepagos ni pagos sobre facturas ``PAID``
+    o ``VOID``. El pago y el nuevo saldo se confirman en un único ``COMMIT``.
+    """
+    invoice = get_invoice(db, invoice_id, for_update=True)
+
+    if invoice.status == InvoiceStatus.PAID:
+        code = invoice.code
+        db.rollback()
+        raise InvalidOrderStateError(f"La factura '{code}' ya está PAID")
+    if invoice.status == InvoiceStatus.VOID:
+        code = invoice.code
+        db.rollback()
+        raise InvalidOrderStateError(
+            f"La factura '{code}' está anulada (VOID) y no admite pagos"
+        )
+
+    amount = _money(data.amount)
+    if amount <= 0:
+        db.rollback()
+        raise InvalidOrderDataError("El importe del pago debe ser mayor que cero")
+
+    balance = _money(invoice.balance_due)
+    if amount > balance:
+        code = invoice.code
+        db.rollback()
+        raise InvalidOrderDataError(
+            f"El pago ({amount}) excede el saldo pendiente de la factura "
+            f"'{code}' ({balance})"
+        )
+
+    invoice.balance_due = _money(balance - amount)
+    if invoice.balance_due == 0:
+        invoice.status = InvoiceStatus.PAID
+
+    _commit(
+        db,
+        duplicate_message=f"Conflicto al registrar el pago de '{invoice.code}'",
+    )
+    db.refresh(invoice)
+    return invoice
+
+
+def void_invoice(db: Session, invoice_id: int) -> Invoice:
+    """Anula una factura emitida sin borrarla ni alterar su historial.
+
+    Solo se permite sobre facturas ``ISSUED`` sin pagos aplicados
+    (``balance_due == total``). Una factura con pagos o ya ``PAID`` exige una
+    nota crédito para devolver el importe. Anular es idempotente.
+    """
+    invoice = get_invoice(db, invoice_id, for_update=True)
+
+    if invoice.status == InvoiceStatus.VOID:
+        db.rollback()
+        return get_invoice(db, invoice_id)
+
+    if invoice.status == InvoiceStatus.PAID:
+        code = invoice.code
+        db.rollback()
+        raise InvalidOrderStateError(
+            f"La factura '{code}' está PAID; emita una nota crédito en lugar "
+            "de anularla"
+        )
+
+    if _money(invoice.balance_due) != _money(invoice.total):
+        code = invoice.code
+        db.rollback()
+        raise InvalidOrderStateError(
+            f"La factura '{code}' tiene pagos aplicados; emita una nota "
+            "crédito en lugar de anularla"
+        )
+
+    # ``VOID`` deja el saldo en cero y excluye la factura del crédito
+    # disponible (``get_pending_balance`` solo suma ``ISSUED``).
+    invoice.status = InvoiceStatus.VOID
+    invoice.balance_due = Decimal("0.00")
+
+    _commit(
+        db,
+        duplicate_message=f"Conflicto al anular la factura '{invoice.code}'",
+    )
+    db.refresh(invoice)
+    return invoice
+
+
+def issue_credit_note(
+    db: Session, invoice_id: int, data: CreditNoteCreate
+) -> CreditNote:
+    """Emite una nota crédito sobre una factura vigente (``ISSUED``/``PAID``).
+
+    Reglas de inmutabilidad financiera:
+
+    - la factura no se modifica en sus importes ni se elimina; la nota es un
+      documento de contrapartida;
+    - el importe acumulado de las notas no puede superar el total facturado;
+    - el saldo pendiente se reduce hasta cero y, si la factura estaba
+      ``ISSUED``, pasa a ``PAID`` cuando queda totalmente acreditada;
+    - una factura ``VOID`` no admite notas crédito porque ya no tiene efecto
+      fiscal.
+
+    La nota y la actualización del saldo se confirman en un único ``COMMIT``.
+    """
+    invoice = get_invoice(db, invoice_id, for_update=True)
+
+    if invoice.status == InvoiceStatus.VOID:
+        code = invoice.code
+        db.rollback()
+        raise InvalidOrderStateError(
+            f"La factura '{code}' está anulada (VOID) y no admite notas crédito"
+        )
+
+    if data.invoice_id is not None and data.invoice_id != invoice_id:
+        code = invoice.code
+        db.rollback()
+        raise InvalidOrderDataError(
+            f"La nota crédito apunta a la factura {data.invoice_id}, pero la "
+            f"ruta corresponde a la factura '{code}'"
+        )
+
+    credited = _money(
+        db.scalar(
+            select(func.coalesce(func.sum(CreditNote.amount), 0)).where(
+                CreditNote.invoice_id == invoice_id
+            )
+        )
+        or 0
+    )
+    creditable = _money(_money(invoice.total) - credited)
+    amount = _money(data.amount)
+
+    if amount <= 0:
+        db.rollback()
+        raise InvalidOrderDataError(
+            "El importe de la nota crédito debe ser mayor que cero"
+        )
+    if amount > creditable:
+        code = invoice.code
+        db.rollback()
+        raise InvalidOrderDataError(
+            f"La nota crédito ({amount}) excede el importe acreditable de la "
+            f"factura '{code}' ({creditable})"
+        )
+
+    if data.code is None:
+        _lock_credit_note_sequence(db, data.issue_date.year)
+        code = _next_credit_note_code(db, data.issue_date.year)
+    else:
+        code = data.code
+        _ensure_unique_credit_note_code(db, code)
+
+    note = CreditNote(
+        code=code,
+        invoice_id=invoice_id,
+        amount=amount,
+        reason=data.reason,
+        issue_date=data.issue_date,
+    )
+    db.add(note)
+
+    new_balance = _money(_money(invoice.balance_due) - amount)
+    invoice.balance_due = new_balance if new_balance > 0 else Decimal("0.00")
+    if invoice.status == InvoiceStatus.ISSUED and invoice.balance_due == 0:
+        invoice.status = InvoiceStatus.PAID
+
+    _commit(
+        db,
+        duplicate_message=f"Ya existe una nota crédito con el código '{code}'",
+    )
+    db.refresh(note)
+    return note
+
+
+def list_credit_notes(
+    db: Session,
+    *,
+    invoice_id: int | None = None,
+    skip: int = 0,
+    limit: int = 100,
+) -> list[CreditNote]:
+    """Lista notas crédito, opcionalmente acotadas a una factura."""
+    stmt = select(CreditNote)
+    if invoice_id is not None:
+        stmt = stmt.where(CreditNote.invoice_id == invoice_id)
+    stmt = stmt.order_by(CreditNote.id).offset(skip).limit(limit)
+    return list(db.scalars(stmt).all())
+
+
+def reject_invoice_mutation(db: Session, invoice_id: int) -> None:
+    """Bloquea cualquier intento de editar o borrar una factura emitida.
+
+    No existen rutas de modificación: este guardia materializa la regla 3 y el
+    escenario 4 con un 400 explícito que remite a ``VOID`` o nota crédito.
+    """
+    invoice = get_invoice(db, invoice_id)
+    raise ImmutableInvoiceError(
+        f"La factura '{invoice.code}' está emitida y no puede editarse ni "
+        "eliminarse; use la anulación (VOID) o emita una nota crédito"
+    )
 
 
 # --------------------------------------------------------------------------- #

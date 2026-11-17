@@ -27,6 +27,11 @@ from src.modules.inventory.router import (
     router as inventory_router,
 )
 from src.modules.inventory.services import InventoryError
+from src.modules.sales.router import (
+    router as sales_router,
+    sales_exception_handler,
+)
+from src.modules.sales.services import SalesServiceError
 from src.modules.users.router import (
     limiter as users_limiter,
     router as users_router,
@@ -73,5 +78,9 @@ app.add_exception_handler(InventoryError, inventory_exception_handler)
 # Traduce los fallos de autenticación a 400/401/403/423 uniformes.
 app.add_exception_handler(UserServiceError, users_exception_handler)
 
+# Traduce las excepciones de dominio de ventas a respuestas HTTP.
+app.add_exception_handler(SalesServiceError, sales_exception_handler)
+
 app.include_router(inventory_router, prefix="/api/v1/inventory")
+app.include_router(sales_router, prefix="/api/v1/sales")
 app.include_router(users_router, prefix="/api/v1/users")

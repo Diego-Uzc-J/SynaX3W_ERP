@@ -40,6 +40,8 @@ __all__ = [
     "InvoiceResponse",
     "InvoiceStatus",
     "SalesOrderCreate",
+    "SalesOrderCancelRequest",
+    "SalesOrderConfirmRequest",
     "SalesOrderItemCreate",
     "SalesOrderItemResponse",
     "SalesOrderResponse",
@@ -342,6 +344,26 @@ class SalesOrderUpdate(SalesSchema):
         return self
 
 
+class SalesOrderConfirmRequest(SalesSchema):
+    """Opciones de la transición a ``CONFIRMED``.
+
+    ``warehouse_id`` permite elegir la bodega de despacho; si se omite se usa
+    la única bodega activa (con varias activas el servicio exige indicarla).
+    """
+
+    warehouse_id: int | None = Field(default=None, gt=0)
+
+
+class SalesOrderCancelRequest(SalesSchema):
+    """Opciones de la cancelación de un pedido."""
+
+    reason: str | None = Field(
+        default=None,
+        max_length=500,
+        description="Motivo de la cancelación (se registra en las notas de inventario).",
+    )
+
+
 class SalesOrderItemResponse(SalesResponseSchema):
     """Representación de salida de una línea de pedido."""
 
@@ -380,13 +402,18 @@ class InvoiceCreate(SalesSchema):
 
     Si se indica ``sales_order_id``, el servicio toma el total del pedido
     confirmado. En una factura directa (sin pedido) el total es obligatorio.
-    ``balance_due`` no se acepta: al emitir nace igual al total.
+    ``balance_due`` no se acepta: al emitir nace igual al total. Si se omite
+    ``code``, el servicio genera uno secuencial ``FAC-YYYY-XXXX``.
     """
 
-    code: str = Field(
+    code: str | None = Field(
+        default=None,
         min_length=1,
         max_length=30,
-        description="Código único de la factura (por ejemplo, FAC-2026-0001).",
+        description=(
+            "Código único de la factura. Si se omite, se genera uno "
+            "secuencial con formato FAC-YYYY-XXXX."
+        ),
         examples=["FAC-2026-0001"],
     )
     sales_order_id: int | None = Field(
@@ -451,15 +478,27 @@ class InvoiceResponse(SalesResponseSchema):
 
 
 class CreditNoteCreate(SalesSchema):
-    """Nota crédito por devolución o ajuste sobre una factura emitida."""
+    """Nota crédito por devolución o ajuste sobre una factura emitida.
 
-    code: str = Field(
+    El ``invoice_id`` es opcional cuando la nota se crea desde la ruta
+    ``/invoices/{id}/credit-notes``; si se envía, debe coincidir con la ruta.
+    """
+
+    code: str | None = Field(
+        default=None,
         min_length=1,
         max_length=30,
-        description="Código único de la nota crédito (por ejemplo, NC-2026-0001).",
+        description=(
+            "Código único de la nota crédito. Si se omite, se genera uno "
+            "secuencial con formato NC-YYYY-XXXX."
+        ),
         examples=["NC-2026-0001"],
     )
-    invoice_id: int = Field(gt=0, description="Factura que se acredita.")
+    invoice_id: int | None = Field(
+        default=None,
+        gt=0,
+        description="Factura que se acredita (opcional si va en la ruta).",
+    )
     amount: Decimal = Field(
         gt=0,
         max_digits=14,
