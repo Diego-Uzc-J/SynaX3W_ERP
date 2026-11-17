@@ -9,6 +9,12 @@ Implementa la primera capa de reglas de ``specs/purchasing_spec.md``:
   impuestos y total a partir de las líneas.
 * Validación estricta de líneas: todo producto incluido debe existir y estar
   activo en ``inventory`` (escenario 7 de la spec).
+* Motor transaccional de ``GoodsReceipt``: exige OC ``APPROVED`` o
+  ``PARTIALLY_RECEIVED`` y proveedor activo, rechaza sobre-recepciones con 400 y
+  registra en un único ``COMMIT`` la recepción, los acumulados de las líneas,
+  el cambio de estado de la OC y los movimientos ``INBOUND`` de ``inventory``.
+  Las recepciones son inmutables: no se exponen actualizaciones y los
+  listeners ORM bloquean cambios o borrados (regla logística del manifiesto).
 
 Las excepciones derivan de ``fastapi.HTTPException`` y declaran su
 ``status_code`` (400, 404 o 409), por lo que FastAPI las traduce directamente a
@@ -25,18 +31,24 @@ from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
 from fastapi import HTTPException
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
-from src.modules.inventory.models import Product
+from src.modules.inventory import services as inventory_services
+from src.modules.inventory.models import MovementType, Product, Warehouse
+from src.modules.inventory.schemas import StockMovementCreate
 from src.modules.purchasing.models import (
+    GoodsReceipt,
+    GoodsReceiptItem,
     PurchaseOrder,
     PurchaseOrderItem,
     PurchaseOrderStatus,
     Supplier,
 )
 from src.modules.purchasing.schemas import (
+    GoodsReceiptCreate,
+    GoodsReceiptItemCreate,
     PurchaseOrderCreate,
     PurchaseOrderItemCreate,
     PurchaseOrderUpdate,
@@ -46,19 +58,24 @@ from src.modules.purchasing.schemas import (
 
 __all__ = [
     "DuplicateResourceError",
+    "ImmutableReceiptError",
     "InactiveProductError",
     "InactiveSupplierError",
     "InvalidOrderDataError",
     "InvalidOrderStateError",
+    "OverReceiptError",
     "PurchasingServiceError",
     "ResourceNotFoundError",
+    "create_goods_receipt",
     "create_purchase_order",
     "create_supplier",
     "deactivate_supplier",
     "ensure_purchase_order_editable",
     "ensure_supplier_active",
+    "get_goods_receipt",
     "get_purchase_order",
     "get_supplier",
+    "list_goods_receipts",
     "list_purchase_orders",
     "list_suppliers",
     "update_purchase_order",
@@ -73,6 +90,17 @@ _MAX_MONEY = Decimal("999999999999.99")
 
 #: Clave base del advisory lock que serializa la secuencia ``OC-YYYY-XXXX``.
 _ORDER_CODE_LOCK_BASE = 8_100_000
+
+#: Clave base del advisory lock que serializa la secuencia ``REC-YYYY-XXXX``.
+_RECEIPT_CODE_LOCK_BASE = 8_200_000
+
+#: Estados de una OC que admiten recepciones de mercancía.
+_RECEIVABLE_ORDER_STATUSES = frozenset(
+    {PurchaseOrderStatus.APPROVED, PurchaseOrderStatus.PARTIALLY_RECEIVED}
+)
+
+#: Autor de los movimientos ``INBOUND`` cuando la recepción no indica usuario.
+_DEFAULT_RECEIPT_USER = "purchasing"
 
 
 # --------------------------------------------------------------------------- #
@@ -131,6 +159,43 @@ class InvalidOrderStateError(PurchasingServiceError):
 
 class InvalidOrderDataError(PurchasingServiceError):
     """Los datos de la orden no cumplen una regla de negocio."""
+
+    status_code = 400
+
+
+class OverReceiptError(PurchasingServiceError):
+    """La recepción supera la cantidad pendiente de una línea de la OC.
+
+    El escenario 4 de ``specs/purchasing_spec.md`` exige 400 Bad Request.
+    """
+
+    status_code = 400
+
+    def __init__(
+        self,
+        *,
+        receipt_code: str,
+        purchase_order_item_id: int,
+        pending: int,
+        requested: int,
+    ) -> None:
+        self.receipt_code = receipt_code
+        self.purchase_order_item_id = purchase_order_item_id
+        self.pending = pending
+        self.requested = requested
+        super().__init__(
+            f"Sobre-recepción en {receipt_code}: la línea de orden "
+            f"{purchase_order_item_id} tiene {pending} unidades pendientes "
+            f"y se intentaron recibir {requested}"
+        )
+
+
+class ImmutableReceiptError(PurchasingServiceError):
+    """Una recepción procesada no puede modificarse ni eliminarse.
+
+    El escenario 6 de la spec y la regla de inmutabilidad logística del
+    manifiesto exigen conservar la trazabilidad del stock.
+    """
 
     status_code = 400
 
@@ -341,6 +406,95 @@ def _lock_order_sequence(db: Session, year: int) -> None:
 def _next_order_code(db: Session, year: int) -> str:
     """Devuelve el siguiente código ``OC-YYYY-XXXX`` para el año indicado."""
     return _next_sequence(db, PurchaseOrder.code, prefix=f"OC-{year}-")
+
+
+def _ensure_unique_receipt_code(
+    db: Session, code: str, *, exclude_id: int | None = None
+) -> None:
+    """Verifica que el código de recepción no esté en uso."""
+    stmt = select(GoodsReceipt.id).where(GoodsReceipt.code == code)
+    if exclude_id is not None:
+        stmt = stmt.where(GoodsReceipt.id != exclude_id)
+    if db.execute(stmt.limit(1)).first() is not None:
+        raise DuplicateResourceError(
+            f"Ya existe una recepción con el código '{code}'"
+        )
+
+
+def _lock_receipt_sequence(db: Session, year: int) -> None:
+    """Serializa la secuencia de códigos de recepción del año."""
+    _lock_sequence(db, base=_RECEIPT_CODE_LOCK_BASE, year=year)
+
+
+def _next_receipt_code(db: Session, year: int) -> str:
+    """Devuelve el siguiente código ``REC-YYYY-XXXX`` para el año indicado."""
+    return _next_sequence(db, GoodsReceipt.code, prefix=f"REC-{year}-")
+
+
+def _get_receivable_order(db: Session, order_id: int) -> PurchaseOrder:
+    """Obtiene una OC con líneas y exige un estado que admita recepciones."""
+    order = get_purchase_order(db, order_id, for_update=True)
+    if order.status not in _RECEIVABLE_ORDER_STATUSES:
+        raise InvalidOrderStateError(
+            f"La orden de compra '{order.code}' está en estado "
+            f"{order.status.value}; solo se pueden recibir órdenes APPROVED "
+            "o PARTIALLY_RECEIVED"
+        )
+    return order
+
+
+def _get_receipt_warehouse(db: Session, warehouse_id: int) -> Warehouse:
+    """Obtiene la bodega destino traduciendo el error de inventario a 404."""
+    try:
+        return inventory_services.get_warehouse(db, warehouse_id)
+    except inventory_services.ResourceNotFoundError as exc:
+        raise ResourceNotFoundError(str(exc)) from exc
+
+
+def _validate_receipt_lines(
+    *,
+    receipt_code: str,
+    order: PurchaseOrder,
+    data: GoodsReceiptCreate,
+) -> list[tuple[PurchaseOrderItem, GoodsReceiptItemCreate]]:
+    """Valida pertenencia y sobre-recepción de cada línea.
+
+    Devuelve pares ``(línea de OC, línea de recepción)`` ya validados. Toda
+    comprobación ocurre antes de escribir en la base de datos, de modo que un
+    rechazo no deja recepciones parciales ni movimientos de stock huérfanos.
+    """
+    order_items = {item.id: item for item in order.items}
+    seen: set[int] = set()
+    validated: list[tuple[PurchaseOrderItem, GoodsReceiptItemCreate]] = []
+
+    for line in data.items:
+        if line.purchase_order_item_id in seen:
+            raise InvalidOrderDataError(
+                "No se puede recibir dos veces la misma línea de orden "
+                "en una sola recepción"
+            )
+        seen.add(line.purchase_order_item_id)
+
+        order_item = order_items.get(line.purchase_order_item_id)
+        if order_item is None:
+            raise InvalidOrderDataError(
+                f"La línea {line.purchase_order_item_id} no pertenece a la "
+                f"orden de compra '{order.code}'"
+            )
+
+        pending = order_item.quantity - order_item.received_quantity
+        if line.quantity > pending:
+            raise OverReceiptError(
+                receipt_code=receipt_code,
+                purchase_order_item_id=order_item.id,
+                pending=pending,
+                requested=line.quantity,
+            )
+        validated.append((order_item, line))
+
+    if not validated:
+        raise InvalidOrderDataError("La recepción debe incluir al menos una línea")
+    return validated
 
 
 # --------------------------------------------------------------------------- #
@@ -579,3 +733,164 @@ def update_purchase_order(
     )
     db.refresh(order)
     return order
+
+
+# --------------------------------------------------------------------------- #
+# Recepción de mercancía — /api/v1/purchasing/receipts
+# --------------------------------------------------------------------------- #
+
+
+def create_goods_receipt(
+    db: Session, receipt_data: GoodsReceiptCreate
+) -> GoodsReceipt:
+    """Registra una recepción y actualiza el stock en una transacción ACID.
+
+    Precondiciones (todas comprobadas antes de escribir):
+
+    * la OC existe, está ``APPROVED`` o ``PARTIALLY_RECEIVED`` y su proveedor
+      sigue activo;
+    * la bodega destino existe en ``inventory``;
+    * cada línea pertenece a la OC y no supere su cantidad pendiente.
+
+    En el mismo ``COMMIT`` se insertan ``GoodsReceipt`` y sus líneas, se
+    incrementa ``received_quantity``, se ajusta el estado de la OC a
+    ``PARTIALLY_RECEIVED`` o ``COMPLETED`` y se registran los movimientos
+    ``INBOUND`` mediante ``inventory_services.create_stock_movement`` con
+    ``commit=False``. Cualquier fallo revierte el conjunto completo.
+    """
+    order = _get_receivable_order(db, receipt_data.purchase_order_id)
+    ensure_supplier_active(db, order.supplier_id)
+    # La existencia de la bodega se valida aquí para devolver un 404 de compras
+    # con mensaje claro antes de escribir; el servicio de inventory la valida
+    # de nuevo al crear cada movimiento.
+    _get_receipt_warehouse(db, receipt_data.warehouse_id)
+
+    if receipt_data.code is None:
+        _lock_receipt_sequence(db, receipt_data.receipt_date.year)
+        code = _next_receipt_code(db, receipt_data.receipt_date.year)
+    else:
+        code = receipt_data.code
+        _ensure_unique_receipt_code(db, code)
+
+    validated = _validate_receipt_lines(
+        receipt_code=code, order=order, data=receipt_data
+    )
+
+    receipt = GoodsReceipt(
+        code=code,
+        purchase_order_id=order.id,
+        warehouse_id=receipt_data.warehouse_id,
+        receipt_date=receipt_data.receipt_date,
+        received_by=receipt_data.received_by,
+        notes=receipt_data.notes,
+    )
+    db.add(receipt)
+
+    for order_item, line in validated:
+        receipt.items.append(
+            GoodsReceiptItem(
+                purchase_order_item_id=order_item.id,
+                quantity=line.quantity,
+            )
+        )
+        order_item.received_quantity += line.quantity
+
+    if all(item.received_quantity >= item.quantity for item in order.items):
+        order.status = PurchaseOrderStatus.COMPLETED
+    else:
+        order.status = PurchaseOrderStatus.PARTIALLY_RECEIVED
+
+    try:
+        for order_item, line in validated:
+            movement = StockMovementCreate(
+                product_id=order_item.product_id,
+                warehouse_destination_id=receipt_data.warehouse_id,
+                movement_type=MovementType.INBOUND,
+                quantity=line.quantity,
+                reference_document=code,
+                notes=(
+                    receipt_data.notes
+                    or f"Recepción {code} de la OC {order.code}"
+                ),
+                created_by=receipt_data.received_by or _DEFAULT_RECEIPT_USER,
+            )
+            inventory_services.create_stock_movement(db, movement, commit=False)
+
+        _commit(
+            db,
+            duplicate_message=f"Ya existe una recepción con el código '{code}'",
+        )
+    except Exception:
+        # Un movimiento, saldo, acumulado o cambio de estado que falle revierte
+        # también la recepción y las líneas ya añadidas a la sesión.
+        db.rollback()
+        raise
+
+    db.refresh(receipt)
+    return receipt
+
+
+def get_goods_receipt(db: Session, receipt_id: int) -> GoodsReceipt:
+    """Obtiene una recepción con sus líneas o lanza ``ResourceNotFoundError``."""
+    stmt = (
+        select(GoodsReceipt)
+        .where(GoodsReceipt.id == receipt_id)
+        .options(selectinload(GoodsReceipt.items))
+    )
+    receipt = db.scalars(stmt).first()
+    if receipt is None:
+        raise ResourceNotFoundError(f"Recepción {receipt_id} no encontrada")
+    return receipt
+
+
+def list_goods_receipts(
+    db: Session,
+    *,
+    skip: int = 0,
+    limit: int = 100,
+    purchase_order_id: int | None = None,
+    warehouse_id: int | None = None,
+) -> list[GoodsReceipt]:
+    """Lista recepciones con filtros por OC o bodega destino."""
+    stmt = select(GoodsReceipt).options(selectinload(GoodsReceipt.items))
+    if purchase_order_id is not None:
+        stmt = stmt.where(GoodsReceipt.purchase_order_id == purchase_order_id)
+    if warehouse_id is not None:
+        stmt = stmt.where(GoodsReceipt.warehouse_id == warehouse_id)
+    stmt = stmt.order_by(GoodsReceipt.id).offset(skip).limit(limit)
+    return list(db.scalars(stmt).all())
+
+
+# --------------------------------------------------------------------------- #
+# Inmutabilidad logística (manifiesto, sección 4 y escenario 6 de la spec)
+# --------------------------------------------------------------------------- #
+
+
+@event.listens_for(GoodsReceipt, "before_update")
+def _forbid_receipt_update(mapper, connection, target) -> None:  # noqa: ARG001
+    raise ImmutableReceiptError(
+        "Las recepciones de mercancía son inmutables: ya impactaron el stock; "
+        "registre un movimiento ADJUSTMENT para corregir el saldo"
+    )
+
+
+@event.listens_for(GoodsReceipt, "before_delete")
+def _forbid_receipt_delete(mapper, connection, target) -> None:  # noqa: ARG001
+    raise ImmutableReceiptError(
+        "Las recepciones de mercancía no pueden eliminarse: conserve la "
+        "trazabilidad del inventario"
+    )
+
+
+@event.listens_for(GoodsReceiptItem, "before_update")
+def _forbid_receipt_item_update(mapper, connection, target) -> None:  # noqa: ARG001
+    raise ImmutableReceiptError(
+        "Las líneas de recepción son inmutables una vez registradas"
+    )
+
+
+@event.listens_for(GoodsReceiptItem, "before_delete")
+def _forbid_receipt_item_delete(mapper, connection, target) -> None:  # noqa: ARG001
+    raise ImmutableReceiptError(
+        "Las líneas de recepción no pueden eliminarse: conserve la trazabilidad"
+    )

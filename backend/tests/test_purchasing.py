@@ -1,13 +1,16 @@
 """Pruebas de aceptación de la capa de servicios de ``purchasing``.
 
-Cubren los escenarios 2, 3 y 7 de ``specs/purchasing_spec.md`` (proveedor
-inactivo, ``tax_id`` duplicado y producto inactivo en una línea de OC), además
-de la generación secuencial de códigos ``OC-YYYY-XXXX`` y el recálculo de
-totales al editar un borrador.
+Cubren los escenarios 1, 2, 3, 4, 6 y 7 de ``specs/purchasing_spec.md``:
+recepción exitosa con impacto en stock, proveedor inactivo, ``tax_id``
+duplicado, sobre-recepción, inmutabilidad de la recepción y producto inactivo
+en una línea de OC. También verifican la secuenciación de códigos
+``OC-YYYY-XXXX`` / ``REC-YYYY-XXXX`` y el recálculo de totales.
 
 Las pruebas son de servicio (sin router todavía) y usan SQLite en memoria; por
 ello comprueban directamente el ``status_code`` de las excepciones HTTP de
-dominio, que es el mismo que FastAPI devolverá al registrar el router.
+dominio, que es el mismo que FastAPI devolverá al registrar el router. Las
+recepciones se validan contra las tablas de ``inventory`` para confirmar la
+atomicidad de la operación.
 """
 
 from __future__ import annotations
@@ -30,13 +33,24 @@ if str(BACKEND_ROOT) not in sys.path:
 os.environ["DATABASE_URL"] = "sqlite://"
 
 from src.core.database import Base  # noqa: E402
-from src.modules.inventory.models import Product  # noqa: E402
+from src.modules.inventory import services as inventory_services  # noqa: E402
+from src.modules.inventory.models import (  # noqa: E402
+    MovementType,
+    Product,
+    Stock,
+    StockMovement,
+    Warehouse,
+)
 from src.modules.purchasing.models import (  # noqa: E402
+    GoodsReceipt,
+    GoodsReceiptItem,
     PurchaseOrder,
     PurchaseOrderStatus,
     Supplier,
 )
 from src.modules.purchasing.schemas import (  # noqa: E402
+    GoodsReceiptCreate,
+    GoodsReceiptItemCreate,
     PurchaseOrderCreate,
     PurchaseOrderItemCreate,
     PurchaseOrderUpdate,
@@ -45,14 +59,19 @@ from src.modules.purchasing.schemas import (  # noqa: E402
 )
 from src.modules.purchasing.services import (  # noqa: E402
     DuplicateResourceError,
+    ImmutableReceiptError,
     InactiveProductError,
     InactiveSupplierError,
     InvalidOrderStateError,
+    OverReceiptError,
     ResourceNotFoundError,
+    create_goods_receipt,
     create_purchase_order,
     create_supplier,
     deactivate_supplier,
+    get_goods_receipt,
     get_purchase_order,
+    list_goods_receipts,
     list_suppliers,
     update_purchase_order,
     update_supplier,
@@ -104,6 +123,30 @@ def product(db_session: Session) -> Product:
     return item
 
 
+@pytest.fixture()
+def warehouse(db_session: Session) -> Warehouse:
+    """Bodega destino de los movimientos ``INBOUND`` de las recepciones."""
+    item = Warehouse(code="BOD-PRINCIPAL", name="Bodega Principal", is_active=True)
+    db_session.add(item)
+    db_session.commit()
+    db_session.refresh(item)
+    return item
+
+
+@pytest.fixture()
+def approved_order(
+    db_session: Session, supplier: Supplier, product: Product
+) -> PurchaseOrder:
+    """OC aprobada de 20 unidades, lista para recibir mercancía."""
+    order = create_purchase_order(
+        db_session, order_payload(supplier.id, product.id, quantity=20)
+    )
+    order.status = PurchaseOrderStatus.APPROVED
+    db_session.commit()
+    db_session.refresh(order)
+    return order
+
+
 # --------------------------------------------------------------------------- #
 # Ayudas
 # --------------------------------------------------------------------------- #
@@ -124,7 +167,11 @@ def supplier_payload(**overrides: object) -> SupplierCreate:
 
 
 def order_payload(
-    supplier_id: int, product_id: int, **overrides: object
+    supplier_id: int,
+    product_id: int,
+    *,
+    quantity: int = 3,
+    **overrides: object,
 ) -> PurchaseOrderCreate:
     """Datos válidos para crear una OC de una línea."""
     values: dict[str, object] = {
@@ -134,7 +181,7 @@ def order_payload(
         "items": [
             PurchaseOrderItemCreate(
                 product_id=product_id,
-                quantity=3,
+                quantity=quantity,
                 unit_price=Decimal("1250.00"),
                 tax_rate=Decimal("19.00"),
             )
@@ -142,6 +189,31 @@ def order_payload(
     }
     values.update(overrides)
     return PurchaseOrderCreate(**values)  # type: ignore[arg-type]
+
+
+def receipt_payload(
+    order: PurchaseOrder,
+    warehouse_id: int,
+    *,
+    quantity: int | None = None,
+    **overrides: object,
+) -> GoodsReceiptCreate:
+    """Datos válidos para recibir la primera línea de una OC."""
+    line = order.items[0]
+    values: dict[str, object] = {
+        "purchase_order_id": order.id,
+        "warehouse_id": warehouse_id,
+        "receipt_date": _TODAY,
+        "received_by": "almacenista-1",
+        "items": [
+            GoodsReceiptItemCreate(
+                purchase_order_item_id=line.id,
+                quantity=line.quantity if quantity is None else quantity,
+            )
+        ],
+    }
+    values.update(overrides)
+    return GoodsReceiptCreate(**values)  # type: ignore[arg-type]
 
 
 # --------------------------------------------------------------------------- #
@@ -171,7 +243,9 @@ def test_get_missing_supplier_returns_404(db_session: Session) -> None:
     assert exc.value.status_code == 404
 
 
-def test_update_and_deactivate_supplier(db_session: Session, supplier: Supplier) -> None:
+def test_update_and_deactivate_supplier(
+    db_session: Session, supplier: Supplier
+) -> None:
     """PATCH parcial y borrado lógico conservan el historial."""
     updated = update_supplier(
         db_session,
@@ -339,3 +413,289 @@ def test_non_draft_order_cannot_be_edited(
 
     # La orden se recupera con sus líneas para el futuro flujo de recepciones.
     assert get_purchase_order(db_session, order.id).items[0].product_id == product.id
+
+
+# --------------------------------------------------------------------------- #
+# Recepción de mercancía
+# --------------------------------------------------------------------------- #
+
+
+def test_goods_receipt_completes_order_and_increases_stock(
+    db_session: Session, supplier: Supplier, product: Product, warehouse: Warehouse
+) -> None:
+    """Escenario 1: recibir todo impacta stock, acumulado y estado en un commit."""
+    order = create_purchase_order(
+        db_session, order_payload(supplier.id, product.id, quantity=50)
+    )
+    order.status = PurchaseOrderStatus.APPROVED
+    db_session.commit()
+
+    receipt = create_goods_receipt(
+        db_session, receipt_payload(order, warehouse.id, quantity=50)
+    )
+
+    assert receipt.code == f"REC-{_TODAY.year}-0001"
+    assert receipt.purchase_order_id == order.id
+    assert receipt.warehouse_id == warehouse.id
+    assert receipt.received_by == "almacenista-1"
+
+    stored_order = get_purchase_order(db_session, order.id)
+    assert stored_order.status is PurchaseOrderStatus.COMPLETED
+    assert stored_order.items[0].received_quantity == 50
+
+    stock = db_session.scalars(
+        select(Stock).where(
+            Stock.product_id == product.id, Stock.warehouse_id == warehouse.id
+        )
+    ).one()
+    assert stock.quantity == 50
+
+    movements = db_session.scalars(select(StockMovement)).all()
+    assert len(movements) == 1
+    movement = movements[0]
+    assert movement.movement_type is MovementType.INBOUND
+    assert movement.product_id == product.id
+    assert movement.warehouse_source_id is None
+    assert movement.warehouse_destination_id == warehouse.id
+    assert movement.quantity == 50
+    assert movement.reference_document == receipt.code
+    assert movement.created_by == "almacenista-1"
+
+    assert get_goods_receipt(db_session, receipt.id).items[0].quantity == 50
+    assert list_goods_receipts(db_session, purchase_order_id=order.id) == [receipt]
+
+
+def test_partial_receipts_accumulate_and_close_order(
+    db_session: Session,
+    approved_order: PurchaseOrder,
+    product: Product,
+    warehouse: Warehouse,
+) -> None:
+    """La recepción parcial acumula cantidades y la última cierra la OC."""
+    first = create_goods_receipt(
+        db_session, receipt_payload(approved_order, warehouse.id, quantity=8)
+    )
+    assert first.code == f"REC-{_TODAY.year}-0001"
+    assert get_purchase_order(db_session, approved_order.id).status is (
+        PurchaseOrderStatus.PARTIALLY_RECEIVED
+    )
+    partial_order = get_purchase_order(db_session, approved_order.id)
+    assert partial_order.items[0].received_quantity == 8
+
+    second = create_goods_receipt(
+        db_session, receipt_payload(approved_order, warehouse.id, quantity=12)
+    )
+    assert second.code == f"REC-{_TODAY.year}-0002"
+
+    final_order = get_purchase_order(db_session, approved_order.id)
+    assert final_order.status is PurchaseOrderStatus.COMPLETED
+    assert final_order.items[0].received_quantity == 20
+
+    stock = db_session.scalars(
+        select(Stock).where(
+            Stock.product_id == product.id, Stock.warehouse_id == warehouse.id
+        )
+    ).one()
+    assert stock.quantity == 20
+    assert len(db_session.scalars(select(StockMovement)).all()) == 2
+    assert len(list_goods_receipts(db_session, warehouse_id=warehouse.id)) == 2
+
+
+def test_over_receipt_is_rejected_atomically(
+    db_session: Session,
+    approved_order: PurchaseOrder,
+    warehouse: Warehouse,
+) -> None:
+    """Escenario 4: 25 > 20 pendientes responde 400 sin escribir nada."""
+    with pytest.raises(OverReceiptError) as exc:
+        create_goods_receipt(
+            db_session, receipt_payload(approved_order, warehouse.id, quantity=25)
+        )
+
+    assert exc.value.status_code == 400
+    assert exc.value.pending == 20
+    assert exc.value.requested == 25
+    assert "pendientes" in str(exc.value)
+
+    assert db_session.scalars(select(GoodsReceipt.id)).all() == []
+    assert db_session.scalars(select(GoodsReceiptItem.id)).all() == []
+    assert db_session.scalars(select(StockMovement.id)).all() == []
+    assert db_session.scalars(select(Stock.id)).all() == []
+    untouched = get_purchase_order(db_session, approved_order.id)
+    assert untouched.status is PurchaseOrderStatus.APPROVED
+    assert untouched.items[0].received_quantity == 0
+
+
+def test_receipt_requires_receivable_order_state(
+    db_session: Session,
+    supplier: Supplier,
+    product: Product,
+    warehouse: Warehouse,
+    approved_order: PurchaseOrder,
+) -> None:
+    """Solo APPROVED/PARTIALLY_RECEIVED admiten recepciones (409 si no)."""
+    draft = create_purchase_order(
+        db_session, order_payload(supplier.id, product.id, quantity=2)
+    )
+    with pytest.raises(InvalidOrderStateError) as exc:
+        create_goods_receipt(
+            db_session, receipt_payload(draft, warehouse.id, quantity=1)
+        )
+    assert exc.value.status_code == 409
+
+    create_goods_receipt(
+        db_session, receipt_payload(approved_order, warehouse.id, quantity=20)
+    )
+    with pytest.raises(InvalidOrderStateError):
+        create_goods_receipt(
+            db_session, receipt_payload(approved_order, warehouse.id, quantity=1)
+        )
+    assert db_session.scalars(select(GoodsReceipt.id)).all() != []
+
+
+def test_inactive_supplier_cannot_receive_goods(
+    db_session: Session,
+    supplier: Supplier,
+    approved_order: PurchaseOrder,
+    warehouse: Warehouse,
+) -> None:
+    """Una OC aprobada tampoco se recibe si el proveedor se desactivó."""
+    deactivate_supplier(db_session, supplier.id)
+
+    with pytest.raises(InactiveSupplierError) as exc:
+        create_goods_receipt(
+            db_session, receipt_payload(approved_order, warehouse.id, quantity=1)
+        )
+    assert exc.value.status_code == 400
+    assert db_session.scalars(select(GoodsReceipt.id)).all() == []
+    assert db_session.scalars(select(StockMovement.id)).all() == []
+
+
+def test_receipts_are_immutable(
+    db_session: Session,
+    approved_order: PurchaseOrder,
+    warehouse: Warehouse,
+) -> None:
+    """Escenario 6: ni la recepción ni sus líneas se editan o eliminan."""
+    receipt = create_goods_receipt(
+        db_session, receipt_payload(approved_order, warehouse.id, quantity=5)
+    )
+    db_session.expunge_all()
+    stored = get_goods_receipt(db_session, receipt.id)
+    movement_ids = db_session.scalars(select(StockMovement.id)).all()
+
+    stored.notes = "Intento de modificación"
+    with pytest.raises(ImmutableReceiptError) as exc:
+        db_session.commit()
+    assert exc.value.status_code == 400
+    db_session.rollback()
+
+    stored = get_goods_receipt(db_session, receipt.id)
+    stored.items[0].quantity = 99
+    with pytest.raises(ImmutableReceiptError):
+        db_session.commit()
+    db_session.rollback()
+
+    stored = get_goods_receipt(db_session, receipt.id)
+    db_session.delete(stored)
+    with pytest.raises(ImmutableReceiptError):
+        db_session.commit()
+    db_session.rollback()
+
+    final = get_goods_receipt(db_session, receipt.id)
+    assert final.notes is None
+    assert final.items[0].quantity == 5
+    assert db_session.scalars(select(StockMovement.id)).all() == movement_ids
+    assert get_purchase_order(db_session, approved_order.id).items[
+        0
+    ].received_quantity == 5
+
+
+def test_duplicate_explicit_receipt_code_is_rejected(
+    db_session: Session,
+    approved_order: PurchaseOrder,
+    warehouse: Warehouse,
+) -> None:
+    """Un código explícito repetido responde 409 sin duplicar la recepción."""
+    payload = dict(code="REC-MANUAL-0001", quantity=1)
+    create_goods_receipt(
+        db_session, receipt_payload(approved_order, warehouse.id, **payload)
+    )
+    with pytest.raises(DuplicateResourceError) as exc:
+        create_goods_receipt(
+            db_session, receipt_payload(approved_order, warehouse.id, **payload)
+        )
+    assert exc.value.status_code == 409
+    assert len(db_session.scalars(select(GoodsReceipt.id)).all()) == 1
+
+
+def test_stock_movement_failure_rolls_back_whole_receipt(
+    monkeypatch: pytest.MonkeyPatch,
+    db_session: Session,
+    supplier: Supplier,
+    product: Product,
+    warehouse: Warehouse,
+) -> None:
+    """Si inventory falla a mitad, se revierte receipt, acumulados y stock."""
+    second_product = Product(
+        sku="LAP-002",
+        name="Laptop Segunda línea",
+        unit_price=Decimal("900.00"),
+        is_active=True,
+    )
+    db_session.add(second_product)
+    db_session.commit()
+    db_session.refresh(second_product)
+
+    order = create_purchase_order(
+        db_session,
+        PurchaseOrderCreate(
+            supplier_id=supplier.id,
+            issue_date=_TODAY,
+            expected_delivery_date=_TODAY + timedelta(days=10),
+            items=[
+                PurchaseOrderItemCreate(
+                    product_id=product.id,
+                    quantity=2,
+                    unit_price=Decimal("1250.00"),
+                ),
+                PurchaseOrderItemCreate(
+                    product_id=second_product.id,
+                    quantity=2,
+                    unit_price=Decimal("900.00"),
+                ),
+            ],
+        ),
+    )
+    order.status = PurchaseOrderStatus.APPROVED
+    db_session.commit()
+
+    original = inventory_services.create_stock_movement
+    calls = 0
+
+    def failing_movement(db, data, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("fallo simulado en inventory")
+        return original(db, data, **kwargs)
+
+    monkeypatch.setattr(inventory_services, "create_stock_movement", failing_movement)
+
+    both_lines = [
+        GoodsReceiptItemCreate(purchase_order_item_id=line.id, quantity=2)
+        for line in order.items
+    ]
+    with pytest.raises(RuntimeError, match="fallo simulado"):
+        create_goods_receipt(
+            db_session, receipt_payload(order, warehouse.id, items=both_lines)
+        )
+
+    assert calls == 2
+    assert db_session.scalars(select(GoodsReceipt.id)).all() == []
+    assert db_session.scalars(select(GoodsReceiptItem.id)).all() == []
+    assert db_session.scalars(select(StockMovement.id)).all() == []
+    assert db_session.scalars(select(Stock.id)).all() == []
+    rolled_back = get_purchase_order(db_session, order.id)
+    assert rolled_back.status is PurchaseOrderStatus.APPROVED
+    assert [line.received_quantity for line in rolled_back.items] == [0, 0]
