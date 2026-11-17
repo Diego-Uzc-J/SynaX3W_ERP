@@ -47,6 +47,9 @@ from src.modules.purchasing.models import (  # noqa: E402
     PurchaseOrder,
     PurchaseOrderStatus,
     Supplier,
+    SupplierBill,
+    SupplierBillPayment,
+    SupplierBillStatus,
 )
 from src.modules.purchasing.schemas import (  # noqa: E402
     GoodsReceiptCreate,
@@ -54,27 +57,43 @@ from src.modules.purchasing.schemas import (  # noqa: E402
     PurchaseOrderCreate,
     PurchaseOrderItemCreate,
     PurchaseOrderUpdate,
+    SupplierBillCreate,
+    SupplierBillPaymentCreate,
     SupplierCreate,
     SupplierUpdate,
 )
 from src.modules.purchasing.services import (  # noqa: E402
     DuplicateResourceError,
+    ImmutableBillError,
     ImmutableReceiptError,
     InactiveProductError,
     InactiveSupplierError,
+    InvalidBillError,
+    InvalidBillStateError,
+    InvalidOrderDataError,
     InvalidOrderStateError,
     OverReceiptError,
     ResourceNotFoundError,
+    approve_purchase_order,
+    cancel_purchase_order,
     create_goods_receipt,
     create_purchase_order,
     create_supplier,
+    create_supplier_bill,
     deactivate_supplier,
+    force_close_purchase_order,
     get_goods_receipt,
     get_purchase_order,
+    get_supplier_bill,
+    list_bill_payments,
     list_goods_receipts,
+    list_supplier_bills,
     list_suppliers,
+    register_bill_payment,
+    reject_bill_mutation,
     update_purchase_order,
     update_supplier,
+    void_supplier_bill,
 )
 
 _TODAY = date.today()
@@ -214,6 +233,29 @@ def receipt_payload(
     }
     values.update(overrides)
     return GoodsReceiptCreate(**values)  # type: ignore[arg-type]
+
+
+def bill_payload(
+    supplier_id: int,
+    *,
+    purchase_order_id: int | None = None,
+    goods_receipt_id: int | None = None,
+    subtotal: Decimal = Decimal("25000.00"),
+    tax_amount: Decimal = Decimal("4750.00"),
+    **overrides: object,
+) -> SupplierBillCreate:
+    """Datos de una factura coherente con 20 unidades a 1250 + 19% de IVA."""
+    values: dict[str, object] = {
+        "supplier_id": supplier_id,
+        "purchase_order_id": purchase_order_id,
+        "goods_receipt_id": goods_receipt_id,
+        "supplier_invoice_number": "F-2026-0042",
+        "issue_date": _TODAY,
+        "subtotal": subtotal,
+        "tax_amount": tax_amount,
+    }
+    values.update(overrides)
+    return SupplierBillCreate(**values)  # type: ignore[arg-type]
 
 
 # --------------------------------------------------------------------------- #
@@ -699,3 +741,340 @@ def test_stock_movement_failure_rolls_back_whole_receipt(
     rolled_back = get_purchase_order(db_session, order.id)
     assert rolled_back.status is PurchaseOrderStatus.APPROVED
     assert [line.received_quantity for line in rolled_back.items] == [0, 0]
+
+
+# --------------------------------------------------------------------------- #
+# Cuentas por pagar
+# --------------------------------------------------------------------------- #
+
+
+def _billed_order(
+    db_session: Session,
+    supplier: Supplier,
+    product: Product,
+    warehouse: Warehouse,
+    *,
+    quantity: int = 20,
+) -> tuple[PurchaseOrder, object]:
+    """Crea una OC aprobada totalmente recibida y devuelve OC y recepción."""
+    order = create_purchase_order(
+        db_session, order_payload(supplier.id, product.id, quantity=quantity)
+    )
+    approve_purchase_order(db_session, order.id)
+    receipt = create_goods_receipt(
+        db_session, receipt_payload(order, warehouse.id, quantity=quantity)
+    )
+    return order, receipt
+
+
+def test_supplier_bill_matches_receipt_and_calculates_due_date(
+    db_session: Session, supplier: Supplier, product: Product, warehouse: Warehouse
+) -> None:
+    """La factura se valora con costos de la OC y cantidades recibidas."""
+    order, receipt = _billed_order(db_session, supplier, product, warehouse)
+
+    bill = create_supplier_bill(
+        db_session,
+        bill_payload(
+            supplier.id,
+            purchase_order_id=order.id,
+            goods_receipt_id=receipt.id,  # type: ignore[arg-type]
+        ),
+    )
+
+    assert bill.code == f"BILL-{_TODAY.year}-0001"
+    assert bill.status is SupplierBillStatus.PENDING
+    assert bill.purchase_order_id == order.id
+    assert bill.goods_receipt_id == receipt.id  # type: ignore[union-attr]
+    assert bill.subtotal == Decimal("25000.00")
+    assert bill.tax_amount == Decimal("4750.00")
+    assert bill.total == Decimal("29750.00")
+    assert bill.balance_due == Decimal("29750.00")
+    assert bill.due_date == _TODAY + timedelta(days=30)
+    assert list_supplier_bills(db_session, status=SupplierBillStatus.PENDING) == [bill]
+
+
+def test_supplier_bill_rejects_amount_mismatch(
+    db_session: Session, supplier: Supplier, product: Product, warehouse: Warehouse
+) -> None:
+    """Facturar por encima de lo recibido o con otra tasa responde 400."""
+    order, receipt = _billed_order(db_session, supplier, product, warehouse)
+    source = dict(
+        purchase_order_id=order.id,
+        goods_receipt_id=receipt.id,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(InvalidBillError) as exc:
+        create_supplier_bill(
+            db_session,
+            bill_payload(
+                supplier.id,
+                subtotal=Decimal("26000.00"),
+                tax_amount=Decimal("4940.00"),
+                **source,
+            ),
+        )
+    assert exc.value.status_code == 400
+    assert "excede lo pendiente" in str(exc.value)
+
+    with pytest.raises(InvalidBillError) as tax_exc:
+        create_supplier_bill(
+            db_session,
+            bill_payload(
+                supplier.id,
+                subtotal=Decimal("25000.00"),
+                tax_amount=Decimal("1000.00"),
+                supplier_invoice_number="F-2026-0043",
+                **source,
+            ),
+        )
+    assert "tasa pactada" in str(tax_exc.value)
+    assert db_session.scalars(select(SupplierBill.id)).all() == []
+
+
+def test_supplier_bill_requires_received_quantities(
+    db_session: Session, supplier: Supplier, product: Product
+) -> None:
+    """No se puede facturar una OC sin movimientos de inventario."""
+    order = create_purchase_order(
+        db_session, order_payload(supplier.id, product.id, quantity=20)
+    )
+    approve_purchase_order(db_session, order.id)
+
+    with pytest.raises(InvalidBillError) as exc:
+        create_supplier_bill(
+            db_session,
+            bill_payload(supplier.id, purchase_order_id=order.id),
+        )
+    assert exc.value.status_code == 400
+    assert "cantidades recibidas" in str(exc.value)
+
+
+def test_partial_bills_cannot_exceed_received_total(
+    db_session: Session, supplier: Supplier, product: Product, warehouse: Warehouse
+) -> None:
+    """Varios abonos facturables pueden repartir lo recibido, sin excederlo."""
+    order, receipt = _billed_order(db_session, supplier, product, warehouse)
+    source = dict(
+        purchase_order_id=order.id,
+        goods_receipt_id=receipt.id,  # type: ignore[arg-type]
+    )
+
+    first = create_supplier_bill(
+        db_session,
+        bill_payload(
+            supplier.id,
+            subtotal=Decimal("12500.00"),
+            tax_amount=Decimal("2375.00"),
+            supplier_invoice_number="F-2026-0001",
+            **source,
+        ),
+    )
+    second = create_supplier_bill(
+        db_session,
+        bill_payload(
+            supplier.id,
+            subtotal=Decimal("12500.00"),
+            tax_amount=Decimal("2375.00"),
+            supplier_invoice_number="F-2026-0002",
+            **source,
+        ),
+    )
+    assert first.code.endswith("0001")
+    assert second.code.endswith("0002")
+
+    with pytest.raises(InvalidBillError) as exc:
+        create_supplier_bill(
+            db_session,
+            bill_payload(
+                supplier.id,
+                subtotal=Decimal("100.00"),
+                tax_amount=Decimal("19.00"),
+                supplier_invoice_number="F-2026-0003",
+                **source,
+            ),
+        )
+    assert "excede lo pendiente" in str(exc.value)
+    assert len(db_session.scalars(select(SupplierBill.id)).all()) == 2
+
+
+def test_bill_payment_history_and_status(
+    db_session: Session, supplier: Supplier, product: Product, warehouse: Warehouse
+) -> None:
+    """Los abonos actualizan el saldo y dejan historial inmutable."""
+    order, receipt = _billed_order(db_session, supplier, product, warehouse)
+    bill = create_supplier_bill(
+        db_session,
+        bill_payload(
+            supplier.id,
+            purchase_order_id=order.id,
+            goods_receipt_id=receipt.id,  # type: ignore[arg-type]
+        ),
+    )
+
+    with pytest.raises(InvalidBillError) as exc:
+        register_bill_payment(
+            db_session,
+            bill.id,
+            SupplierBillPaymentCreate(amount=Decimal("29750.01")),
+        )
+    assert exc.value.status_code == 400
+    assert db_session.scalars(select(SupplierBillPayment.id)).all() == []
+
+    partial = register_bill_payment(
+        db_session,
+        bill.id,
+        SupplierBillPaymentCreate(amount=Decimal("10000.00"), reference="TRANS-1"),
+    )
+    assert partial.status is SupplierBillStatus.PARTIALLY_PAID
+    assert partial.balance_due == Decimal("19750.00")
+
+    paid = register_bill_payment(
+        db_session,
+        bill.id,
+        SupplierBillPaymentCreate(amount=Decimal("19750.00")),
+    )
+    assert paid.status is SupplierBillStatus.PAID
+    assert paid.balance_due == Decimal("0.00")
+
+    with pytest.raises(InvalidBillStateError) as state_exc:
+        register_bill_payment(
+            db_session,
+            bill.id,
+            SupplierBillPaymentCreate(amount=Decimal("1.00")),
+        )
+    assert state_exc.value.status_code == 409
+
+    payments = list_bill_payments(db_session, bill_id=bill.id)
+    assert [payment.amount for payment in payments] == [
+        Decimal("10000.00"),
+        Decimal("19750.00"),
+    ]
+    assert payments[0].reference == "TRANS-1"
+
+
+def test_financial_documents_are_immutable(
+    db_session: Session, supplier: Supplier, product: Product, warehouse: Warehouse
+) -> None:
+    """Ni facturas ni abonos se editan o eliminan; solo contrapartidas."""
+    order, receipt = _billed_order(db_session, supplier, product, warehouse)
+    bill = create_supplier_bill(
+        db_session,
+        bill_payload(
+            supplier.id,
+            purchase_order_id=order.id,
+            goods_receipt_id=receipt.id,  # type: ignore[arg-type]
+        ),
+    )
+    register_bill_payment(
+        db_session, bill.id, SupplierBillPaymentCreate(amount=Decimal("1000.00"))
+    )
+    db_session.expunge_all()
+
+    stored = get_supplier_bill(db_session, bill.id)
+    stored.subtotal = Decimal("1.00")
+    with pytest.raises(ImmutableBillError) as exc:
+        db_session.commit()
+    assert exc.value.status_code == 400
+    db_session.rollback()
+
+    stored = get_supplier_bill(db_session, bill.id)
+    stored.issue_date = _TODAY + timedelta(days=1)
+    with pytest.raises(ImmutableBillError):
+        db_session.commit()
+    db_session.rollback()
+
+    stored = get_supplier_bill(db_session, bill.id)
+    db_session.delete(stored)
+    with pytest.raises(ImmutableBillError):
+        db_session.commit()
+    db_session.rollback()
+
+    payment = db_session.scalars(select(SupplierBillPayment)).one()
+    payment.amount = Decimal("1.00")
+    with pytest.raises(ImmutableBillError):
+        db_session.commit()
+    db_session.rollback()
+
+    payment = db_session.scalars(select(SupplierBillPayment)).one()
+    db_session.delete(payment)
+    with pytest.raises(ImmutableBillError):
+        db_session.commit()
+    db_session.rollback()
+
+    final = get_supplier_bill(db_session, bill.id)
+    assert final.subtotal == Decimal("25000.00")
+    assert final.issue_date == _TODAY
+    assert final.balance_due == Decimal("28750.00")
+    assert len(list_bill_payments(db_session, bill_id=bill.id)) == 1
+
+    with pytest.raises(ImmutableBillError):
+        reject_bill_mutation(db_session, bill.id)
+
+
+def test_void_supplier_bill_and_duplicate_invoice_number(
+    db_session: Session, supplier: Supplier, product: Product, warehouse: Warehouse
+) -> None:
+    """VOID solo entre facturas sin pagos; el número físico es único."""
+    order, receipt = _billed_order(db_session, supplier, product, warehouse)
+    source = dict(
+        purchase_order_id=order.id,
+        goods_receipt_id=receipt.id,  # type: ignore[arg-type]
+    )
+    partial = dict(subtotal=Decimal("12500.00"), tax_amount=Decimal("2375.00"))
+    bill = create_supplier_bill(db_session, bill_payload(supplier.id, **partial, **source))
+
+    with pytest.raises(DuplicateResourceError) as exc:
+        create_supplier_bill(db_session, bill_payload(supplier.id, **partial, **source))
+    assert exc.value.status_code == 409
+
+    unpaid = create_supplier_bill(
+        db_session,
+        bill_payload(
+            supplier.id,
+            supplier_invoice_number="F-2026-0099",
+            **partial,
+            **source,
+        ),
+    )
+    voided = void_supplier_bill(db_session, unpaid.id)
+    assert voided.status is SupplierBillStatus.VOID
+    assert voided.balance_due == Decimal("0.00")
+    assert void_supplier_bill(db_session, unpaid.id).status is SupplierBillStatus.VOID
+
+    register_bill_payment(
+        db_session, bill.id, SupplierBillPaymentCreate(amount=Decimal("100.00"))
+    )
+    with pytest.raises(InvalidBillStateError):
+        void_supplier_bill(db_session, bill.id)
+
+
+def test_order_approve_cancel_and_force_close(
+    db_session: Session, supplier: Supplier, product: Product, warehouse: Warehouse
+) -> None:
+    """Transiciones de OC y bloqueo de cancelación con recepciones."""
+    order = create_purchase_order(
+        db_session, order_payload(supplier.id, product.id, quantity=2)
+    )
+    approved = approve_purchase_order(db_session, order.id)
+    assert approved.status is PurchaseOrderStatus.APPROVED
+
+    sent_order = create_purchase_order(
+        db_session, order_payload(supplier.id, product.id, quantity=2)
+    )
+    sent = approve_purchase_order(db_session, sent_order.id, send=True)
+    assert sent.status is PurchaseOrderStatus.SENT
+    assert cancel_purchase_order(db_session, sent.id).status is (
+        PurchaseOrderStatus.CANCELLED
+    )
+
+    create_goods_receipt(
+        db_session, receipt_payload(approved, warehouse.id, quantity=1)
+    )
+    with pytest.raises(InvalidOrderDataError) as exc:
+        cancel_purchase_order(db_session, approved.id)
+    assert exc.value.status_code == 400
+    assert "movimientos de inventario" in str(exc.value)
+
+    closed = force_close_purchase_order(db_session, approved.id)
+    assert closed.status is PurchaseOrderStatus.FORCE_CLOSED

@@ -2,7 +2,7 @@
 
 Implementa las entidades descritas en ``specs/purchasing_spec.md`` (sección 2):
 ``Supplier``, ``PurchaseOrder``, ``PurchaseOrderItem``, ``GoodsReceipt``,
-``GoodsReceiptItem`` y ``SupplierBill``.
+``GoodsReceiptItem``, ``SupplierBill`` y ``SupplierBillPayment``.
 
 Convenciones alineadas con ``sales`` e ``inventory``:
 
@@ -393,10 +393,53 @@ class SupplierBill(Base):
         back_populates="bills"
     )
     goods_receipt: Mapped[GoodsReceipt | None] = relationship(back_populates="bills")
+    payments: Mapped[list[SupplierBillPayment]] = relationship(
+        back_populates="bill",
+        cascade="all, delete-orphan",
+    )
 
     def __repr__(self) -> str:  # pragma: no cover - ayuda de depuración
         return (
             f"<SupplierBill id={self.id!r} code={self.code!r} status={self.status!r}>"
+        )
+
+
+class SupplierBillPayment(Base):
+    """Abono aplicado a una cuenta por pagar.
+
+    Como ``InvoicePayment`` en ``sales``, materializa el historial que respalda
+    ``SupplierBill.balance_due``. Es un documento inmutable: las correcciones se
+    hacen con nuevos abonos o con la anulación de la factura, nunca editando el
+    abono original. ``ON DELETE RESTRICT`` preserva la trazabilidad financiera.
+    """
+
+    __tablename__ = "supplier_bill_payments"
+    __table_args__ = (
+        CheckConstraint(
+            "amount > 0", name="ck_supplier_bill_payments_amount_positive"
+        ),
+        Index("ix_supplier_bill_payments_bill_id", "bill_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    bill_id: Mapped[int] = mapped_column(
+        ForeignKey("supplier_bills.id", ondelete="RESTRICT"), nullable=False
+    )
+    amount: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    paid_at: Mapped[date] = mapped_column(
+        Date, nullable=False, default=date.today, server_default=func.current_date()
+    )
+    reference: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    bill: Mapped[SupplierBill] = relationship(back_populates="payments")
+
+    def __repr__(self) -> str:  # pragma: no cover - ayuda de depuración
+        return (
+            f"<SupplierBillPayment id={self.id!r} bill_id={self.bill_id!r} "
+            f"amount={self.amount!r}>"
         )
 
 
@@ -409,5 +452,6 @@ __all__ = [
     "PurchaseOrderStatus",
     "Supplier",
     "SupplierBill",
+    "SupplierBillPayment",
     "SupplierBillStatus",
 ]

@@ -39,6 +39,8 @@ __all__ = [
     "GoodsReceiptItemCreate",
     "GoodsReceiptItemResponse",
     "GoodsReceiptResponse",
+    "PurchaseOrderApproveRequest",
+    "PurchaseOrderCancelRequest",
     "PurchaseOrderCreate",
     "PurchaseOrderItemCreate",
     "PurchaseOrderItemResponse",
@@ -46,6 +48,8 @@ __all__ = [
     "PurchaseOrderStatus",
     "PurchaseOrderUpdate",
     "SupplierBillCreate",
+    "SupplierBillPaymentCreate",
+    "SupplierBillPaymentResponse",
     "SupplierBillResponse",
     "SupplierBillStatus",
     "SupplierCreate",
@@ -332,6 +336,25 @@ class PurchaseOrderUpdate(PurchasingSchema):
         return self
 
 
+class PurchaseOrderApproveRequest(PurchasingSchema):
+    """Cuerpo opcional de la aprobación de una OC."""
+
+    send: bool = Field(
+        default=False,
+        description="Si es true la orden queda en SENT; si no, en APPROVED.",
+    )
+
+
+class PurchaseOrderCancelRequest(PurchasingSchema):
+    """Cuerpo opcional de la cancelación de una OC."""
+
+    reason: str | None = Field(
+        default=None,
+        max_length=255,
+        description="Motivo de la cancelación (solo trazabilidad).",
+    )
+
+
 class PurchaseOrderItemResponse(PurchasingResponseSchema):
     """Representación de salida de una línea de orden de compra."""
 
@@ -556,4 +579,35 @@ class SupplierBillResponse(PurchasingResponseSchema):
     tax_amount: Decimal
     total: Decimal
     balance_due: Decimal
+    created_at: datetime
+
+
+class SupplierBillPaymentCreate(PurchasingSchema):
+    """Abono total o parcial aplicado a una cuenta por pagar."""
+
+    amount: Decimal = Field(
+        gt=0,
+        max_digits=14,
+        decimal_places=2,
+        description="Importe del abono; debe ser mayor que cero.",
+        examples=["500.00"],
+    )
+    paid_at: date = Field(
+        default_factory=date.today, description="Fecha en que se realizó el pago."
+    )
+    reference: str | None = Field(
+        default=None,
+        max_length=100,
+        description="Comprobante o referencia bancaria del pago.",
+    )
+
+
+class SupplierBillPaymentResponse(PurchasingResponseSchema):
+    """Abono registrado en el historial de una cuenta por pagar."""
+
+    id: int
+    bill_id: int
+    amount: Decimal
+    paid_at: date
+    reference: str | None
     created_at: datetime
