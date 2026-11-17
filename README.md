@@ -38,6 +38,7 @@ El desarrollo del sistema sigue la metodología **Spec-Driven Development (SDD)*
 * 🗄️ **Base de Datos y Migraciones:** Configuración de PostgreSQL, Docker Compose y uso de Alembic. — [Ver guía de base de datos](docs/database_setup.md)
 * 📦 **Diagramas de Inventario:** Arquitectura y flujos del módulo de inventario. — [Ver diagramas](docs/inventory_diagrams.md)
 * 🔐 **Diagramas de Usuarios y Roles:** Arquitectura y flujos del módulo de usuarios y roles. — [Ver diagramas](docs/users_diagrams.md)
+* 💼 **Diagramas de Ventas y Facturación (`sales`):** Arquitectura y flujos del módulo de ventas y facturación. — [Ver diagramas](docs/sales_diagrams.md)
 
 
 ---
