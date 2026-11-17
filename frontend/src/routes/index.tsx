@@ -4,7 +4,10 @@ import AppLayout from "../layouts/AppLayout";
 import InventoryPage from "../modules/inventory/InventoryPage";
 import ProductList from "../modules/inventory/ProductList";
 import WarehouseList from "../modules/inventory/WarehouseList";
+import GoodsReceiptList from "../modules/purchasing/GoodsReceiptList";
 import PurchaseOrderList from "../modules/purchasing/PurchaseOrderList";
+import SupplierBillDetail from "../modules/purchasing/SupplierBillDetail";
+import SupplierBillList from "../modules/purchasing/SupplierBillList";
 import SupplierList from "../modules/purchasing/SupplierList";
 import CustomerList from "../modules/sales/CustomerList";
 import InvoiceDetail from "../modules/sales/InvoiceDetail";
@@ -92,6 +95,18 @@ export const router = createBrowserRouter([
                   {
                     path: "purchasing/orders",
                     element: <PurchaseOrderList />,
+                  },
+                  {
+                    path: "purchasing/receipts",
+                    element: <GoodsReceiptList />,
+                  },
+                  {
+                    path: "purchasing/bills",
+                    element: <SupplierBillList />,
+                  },
+                  {
+                    path: "purchasing/bills/:billId",
+                    element: <SupplierBillDetail />,
                   },
                 ],
               },

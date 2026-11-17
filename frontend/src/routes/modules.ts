@@ -41,7 +41,7 @@ export const MODULES: readonly ModuleDefinition[] = [
   {
     key: "purchasing",
     label: "Compras",
-    description: "Proveedores y órdenes de compra",
+    description: "Proveedores, recepciones y cuentas por pagar",
     path: "/purchasing",
     implemented: true,
   },
@@ -120,7 +120,17 @@ export const PURCHASING_LINKS = [
   {
     to: "/purchasing/orders",
     label: "Órdenes de compra",
-    description: "Aprobación y recepciones",
+    description: "Aprobación, recepciones y cierres",
+  },
+  {
+    to: "/purchasing/receipts",
+    label: "Recepciones",
+    description: "Entradas de mercancía al stock",
+  },
+  {
+    to: "/purchasing/bills",
+    label: "Facturas",
+    description: "Cuentas por pagar y abonos",
   },
 ] as const;
 

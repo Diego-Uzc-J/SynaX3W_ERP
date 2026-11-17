@@ -17,6 +17,41 @@ export function errorMessage(error: unknown): string | null {
  */
 export function errorHint(message: string): string | null {
   const normalized = message.toLowerCase();
+  // Las pistas de facturación van primero: sus mensajes también contienen
+  // palabras como "pendiente" o "recibidas" que activarían las de recepción.
+  if (normalized.includes("tasa pactada")) {
+    return (
+      "Los impuestos deben guardar la misma proporción que la tasa pactada " +
+      "en las líneas recibidas; usa los importes sugeridos."
+    );
+  }
+  if (normalized.includes("no hay cantidades recibidas")) {
+    return (
+      "Solo se factura lo recibido físicamente. Registra primero la recepción " +
+      "de mercancía antes de emitir la factura."
+    );
+  }
+  if (normalized.includes("saldo") || normalized.includes("excede")) {
+    return (
+      "El importe supera el saldo pendiente o lo facturable del documento. " +
+      "Ajusta el valor o consulta el detalle antes de reintentar."
+    );
+  }
+  if (normalized.includes("impuestos")) {
+    return (
+      "Revisa los impuestos facturados: deben respetar la tasa de las líneas " +
+      "recibidas y no superar lo pendiente."
+    );
+  }
+  if (normalized.includes("anular")) {
+    return "Solo se anulan facturas sin abonos; las pagadas requieren un ajuste formal.";
+  }
+  if (normalized.includes("número") && normalized.includes("factura")) {
+    return "Revisa el número de factura del proveedor: debe ser único por proveedor.";
+  }
+  if (normalized.includes("abono") || normalized.includes("pago")) {
+    return "Revisa el importe y la fecha del abono; no se permiten pagos sobre facturas cerradas.";
+  }
   if (normalized.includes("pendientes") || normalized.includes("sobre")) {
     return (
       "La cantidad supera lo pendiente de la línea. Ajusta las cantidades " +
@@ -40,9 +75,6 @@ export function errorHint(message: string): string | null {
   }
   if (normalized.includes("bodega") || normalized.includes("warehouse")) {
     return "Selecciona una bodega activa en inventario y vuelve a intentarlo.";
-  }
-  if (normalized.includes("número de factura") || normalized.includes("factura")) {
-    return "Revisa el número de factura del proveedor: debe ser único por proveedor.";
   }
   return null;
 }

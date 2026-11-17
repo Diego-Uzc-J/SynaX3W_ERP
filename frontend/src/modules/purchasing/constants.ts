@@ -1,6 +1,9 @@
-/** Etiquetas, tonos y reglas de transición de las órdenes de compra. */
+/** Etiquetas, tonos y reglas de transición de órdenes y cuentas por pagar. */
 
-import type { PurchaseOrderStatus } from "../../api/purchasing";
+import type {
+  PurchaseOrderStatus,
+  SupplierBillStatus,
+} from "../../api/purchasing";
 
 export const ORDER_STATUS_LABELS: Record<PurchaseOrderStatus, string> = {
   DRAFT: "Borrador",
@@ -60,4 +63,39 @@ export function isForceClosableOrderStatus(
   status: PurchaseOrderStatus,
 ): boolean {
   return isReceivableOrderStatus(status);
+}
+
+// --------------------------------------------------------------------------- //
+// Cuentas por pagar
+// --------------------------------------------------------------------------- //
+
+export const BILL_STATUS_LABELS: Record<SupplierBillStatus, string> = {
+  PENDING: "Pendiente",
+  PARTIALLY_PAID: "Pago parcial",
+  PAID: "Pagada",
+  VOID: "Anulada",
+};
+
+export const BILL_STATUS_HINTS: Record<SupplierBillStatus, string> = {
+  PENDING: "Registrada sin abonos; admite pagos y anulación.",
+  PARTIALLY_PAID: "Con abonos parciales; admite nuevos pagos.",
+  PAID: "Saldo cubierto; no admite más abonos.",
+  VOID: "Anulada sin alterar su historial; no admite pagos.",
+};
+
+export const BILL_STATUS_TONES: Record<SupplierBillStatus, BadgeTone> = {
+  PENDING: "warning",
+  PARTIALLY_PAID: "warning",
+  PAID: "success",
+  VOID: "muted",
+};
+
+/** El servicio solo acepta abonos sobre facturas pendientes o pagas a medias. */
+export function canPayBill(status: SupplierBillStatus): boolean {
+  return status === "PENDING" || status === "PARTIALLY_PAID";
+}
+
+/** Solo se anulan facturas sin abonos; VOID es idempotente en el backend. */
+export function canVoidBill(status: SupplierBillStatus): boolean {
+  return status === "PENDING";
 }

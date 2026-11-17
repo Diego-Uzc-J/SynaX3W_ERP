@@ -1,15 +1,14 @@
-import { useEffect, useMemo, useState } from "react";
+import { useState } from "react";
 
-import { useWarehouses } from "../../api/inventory";
 import {
   useApprovePurchaseOrder,
   useCancelPurchaseOrder,
-  useCreateGoodsReceipt,
   useForceClosePurchaseOrder,
 } from "../../api/purchasing";
 import type { PurchaseOrder } from "../../api/purchasing";
 import { errorHint, errorMessage } from "./errors";
-import { formatMoney, parseQuantity, todayIso } from "./format";
+import { formatMoney } from "./format";
+import GoodsReceiptForm from "./GoodsReceiptForm";
 import PurchasingDialog from "./PurchasingDialog";
 
 interface OrderDialogProps {
@@ -137,244 +136,23 @@ export function ApproveOrderDialog({
 // Recepción de mercancía
 // --------------------------------------------------------------------------- //
 
-function ReceiveOrderContent({ order, onClose, onDone }: ContentProps) {
-  const [warehouseId, setWarehouseId] = useState("");
-  const [quantities, setQuantities] = useState<Record<number, string>>({});
-  const [formError, setFormError] = useState<string | null>(null);
-
-  const warehousesQuery = useWarehouses({ active_only: true, limit: 200 });
-  const warehouses = warehousesQuery.data ?? [];
-  const receiptMutation = useCreateGoodsReceipt();
-
-  // Al abrir, se precarga el saldo pendiente de cada línea (máximo recibible).
-  useEffect(() => {
-    const initial: Record<number, string> = {};
-    for (const item of order.items) {
-      initial[item.id] = String(Math.max(0, item.quantity - item.received_quantity));
-    }
-    setQuantities(initial);
-    setFormError(null);
-  }, [order]);
-
-  useEffect(() => {
-    if (warehouseId !== "" || warehouses.length !== 1) {
-      return;
-    }
-    const only = warehouses[0];
-    if (only !== undefined) {
-      setWarehouseId(String(only.id));
-    }
-  }, [warehouses, warehouseId]);
-
-  const pendingByItem = useMemo(
-    () =>
-      new Map(
-        order.items.map((item) => [
-          item.id,
-          Math.max(0, item.quantity - item.received_quantity),
-        ]),
-      ),
-    [order.items],
-  );
-
-  function validate(): string | null {
-    if (warehouseId === "") {
-      return "Selecciona la bodega destino de la mercancía.";
-    }
-    let hasQuantity = false;
-    for (const item of order.items) {
-      const raw = quantities[item.id] ?? "0";
-      const pending = pendingByItem.get(item.id) ?? 0;
-      if (raw.trim() === "" || raw.trim() === "0") {
-        continue;
-      }
-      const quantity = parseQuantity(raw);
-      if (quantity === null) {
-        return `Línea ${item.id}: usa una cantidad entera mayor que cero.`;
-      }
-      if (quantity > pending) {
-        return `Línea ${item.id}: quedan ${pending} unidades pendientes; la recepción se rechazaría por sobre-recepción.`;
-      }
-      hasQuantity = true;
-    }
-    if (!hasQuantity) {
-      return "Indica al menos una cantidad a recibir.";
-    }
-    return null;
-  }
-
-  function handleReceive() {
-    const message = validate();
-    if (message !== null) {
-      setFormError(message);
-      return;
-    }
-    setFormError(null);
-
-    const items = order.items
-      .map((item) => ({
-        purchase_order_item_id: item.id,
-        quantity: parseQuantity(quantities[item.id] ?? "0") ?? 0,
-      }))
-      .filter((item) => item.quantity > 0);
-
-    receiptMutation.mutate(
-      {
-        purchase_order_id: order.id,
-        warehouse_id: Number(warehouseId),
-        receipt_date: todayIso(),
-        items,
-      },
-      {
-        onSuccess: (receipt) =>
-          onDone(
-            `Recepción ${receipt.code} registrada; el stock fue actualizado y la orden cambió de estado.`,
-          ),
-      },
-    );
-  }
-
-  const serverMessage = errorMessage(receiptMutation.error);
-  const visibleError = formError ?? serverMessage;
-
-  return (
-    <PurchasingDialog
-      open
-      title={`Recibir mercancía · ${order.code}`}
-      subtitle="La recepción incrementa el stock en la bodega elegida y cierra la orden al completarse."
-      onClose={onClose}
-      footer={
-        <>
-          <button type="button" onClick={onClose} className={secondaryButton}>
-            Volver
-          </button>
-          <button
-            type="button"
-            onClick={handleReceive}
-            disabled={receiptMutation.isPending || warehousesQuery.isPending}
-            className={primaryButton}
-          >
-            {receiptMutation.isPending ? "Registrando…" : "Registrar recepción"}
-          </button>
-        </>
-      }
-    >
-      <div>
-        <label className={labelClass} htmlFor="receipt-warehouse">
-          Bodega destino <span className="text-signal-600">*</span>
-        </label>
-        <select
-          id="receipt-warehouse"
-          className={fieldClass}
-          value={warehouseId}
-          onChange={(event) => setWarehouseId(event.currentTarget.value)}
-        >
-          <option value="">Selecciona una bodega activa</option>
-          {warehouses.map((warehouse) => (
-            <option key={warehouse.id} value={warehouse.id}>
-              {warehouse.code} — {warehouse.name}
-            </option>
-          ))}
-        </select>
-        {warehousesQuery.isPending ? (
-          <p className="mt-1 text-xs text-ink-500">Cargando bodegas…</p>
-        ) : null}
-        {!warehousesQuery.isPending && warehouses.length === 0 ? (
-          <p className="mt-2 border-l-2 border-signal-500 bg-signal-100 px-3 py-2 text-xs font-medium text-signal-600">
-            No hay bodegas activas. Activa una en inventario antes de recibir.
-          </p>
-        ) : null}
-        {warehousesQuery.error === null ? null : (
-          <p className="mt-2 border-l-2 border-signal-500 bg-signal-100 px-3 py-2 text-xs font-medium text-signal-600">
-            No se pudieron cargar las bodegas: {warehousesQuery.error.message}
-          </p>
-        )}
-      </div>
-
-      <section aria-labelledby="receipt-lines-heading">
-        <h3
-          id="receipt-lines-heading"
-          className="text-sm font-bold tracking-tight"
-        >
-          Cantidades a recibir
-        </h3>
-        <ul className="mt-2 divide-y divide-concrete-200 border border-concrete-200 bg-white">
-          {order.items.map((item) => {
-            const pending = pendingByItem.get(item.id) ?? 0;
-            return (
-              <li
-                key={item.id}
-                className="grid gap-2 px-3 py-2 sm:grid-cols-[1fr_7rem]"
-              >
-                <div className="min-w-0">
-                  <span className="block truncate text-sm font-medium text-ink-950">
-                    Producto #{item.product_id}
-                  </span>
-                  <span className="text-xs text-ink-500">
-                    Ordenadas {item.quantity} · recibidas{" "}
-                    {item.received_quantity} · pendientes {pending}
-                  </span>
-                </div>
-                <div>
-                  <label
-                    className="sr-only"
-                    htmlFor={`receipt-qty-${item.id}`}
-                  >
-                    Cantidad a recibir del producto #{item.product_id}
-                  </label>
-                  <input
-                    id={`receipt-qty-${item.id}`}
-                    className={fieldClass}
-                    type="text"
-                    inputMode="numeric"
-                    value={quantities[item.id] ?? ""}
-                    onChange={(event) =>
-                      setQuantities((current) => ({
-                        ...current,
-                        [item.id]: event.currentTarget.value,
-                      }))
-                    }
-                  />
-                </div>
-              </li>
-            );
-          })}
-        </ul>
-        <p className="mt-1 text-xs text-ink-500">
-          Deja en 0 las líneas que no se reciben. No se permite superar el saldo
-          pendiente (el backend rechaza la operación de forma atómica).
-        </p>
-      </section>
-
-      {visibleError === null ? null : (
-        <div
-          role="alert"
-          className="border-l-2 border-signal-500 bg-signal-100 px-3 py-2 text-sm font-medium text-signal-600"
-        >
-          <p>{visibleError}</p>
-          {formError === null && serverMessage !== null ? (
-            <p className="mt-1 font-normal">
-              {errorHint(serverMessage) ??
-                "Revisa los datos y vuelve a intentarlo."}
-            </p>
-          ) : null}
-        </div>
-      )}
-    </PurchasingDialog>
-  );
-}
-
+/**
+ * Acción rápida desde una OC: reutiliza el formulario completo de recepciones
+ * con la orden ya preseleccionada.
+ */
 export function ReceiveOrderDialog({
   open,
   order,
   onClose,
   onDone,
 }: OrderDialogProps) {
-  if (!open || order === null) {
-    return null;
-  }
   return (
-    <ReceiveOrderContent order={order} onClose={onClose} onDone={onDone} />
+    <GoodsReceiptForm
+      open={open && order !== null}
+      order={order}
+      onClose={onClose}
+      onDone={onDone}
+    />
   );
 }
 

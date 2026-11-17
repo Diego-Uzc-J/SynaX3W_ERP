@@ -1,5 +1,10 @@
-import type { PurchaseOrderStatus } from "../../api/purchasing";
+import type {
+  PurchaseOrderStatus,
+  SupplierBillStatus,
+} from "../../api/purchasing";
 import {
+  BILL_STATUS_LABELS,
+  BILL_STATUS_TONES,
   ORDER_STATUS_LABELS,
   ORDER_STATUS_TONES,
 } from "./constants";
@@ -42,6 +47,13 @@ function Badge({ tone, label }: { tone: BadgeTone; label: string }) {
 export function OrderStatusBadge({ status }: { status: PurchaseOrderStatus }) {
   return (
     <Badge tone={ORDER_STATUS_TONES[status]} label={ORDER_STATUS_LABELS[status]} />
+  );
+}
+
+/** Estado de una cuenta por pagar (PENDING / PARTIALLY_PAID / PAID / VOID). */
+export function BillStatusBadge({ status }: { status: SupplierBillStatus }) {
+  return (
+    <Badge tone={BILL_STATUS_TONES[status]} label={BILL_STATUS_LABELS[status]} />
   );
 }
 

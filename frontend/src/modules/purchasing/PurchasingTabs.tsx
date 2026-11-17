@@ -3,6 +3,8 @@ import { NavLink } from "react-router-dom";
 const TABS = [
   { to: "/purchasing/suppliers", label: "Proveedores" },
   { to: "/purchasing/orders", label: "Órdenes de compra" },
+  { to: "/purchasing/receipts", label: "Recepciones" },
+  { to: "/purchasing/bills", label: "Facturas" },
 ] as const;
 
 /** Navegación secundaria común a las vistas del módulo de compras. */

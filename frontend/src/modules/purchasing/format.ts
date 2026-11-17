@@ -111,3 +111,13 @@ export function todayPlusDays(days: number): string {
   value.setDate(value.getDate() + days);
   return toIsoDate(value);
 }
+
+/** Suma días a una fecha `YYYY-MM-DD` (para sugerir el vencimiento). */
+export function addDaysToIso(value: string, days: number): string {
+  const parsed = new Date(`${value}T00:00:00`);
+  if (Number.isNaN(parsed.getTime())) {
+    return value;
+  }
+  parsed.setDate(parsed.getDate() + days);
+  return toIsoDate(parsed);
+}
