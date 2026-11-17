@@ -407,6 +407,7 @@ def create_stock_movement(
     data: StockMovementCreate,
     *,
     allow_negative_stock: bool | None = None,
+    commit: bool = True,
 ) -> StockMovement:
     """Registra un movimiento y actualiza ``Stock`` de forma atómica.
 
@@ -414,6 +415,11 @@ def create_stock_movement(
     ``ALLOW_NEGATIVE_STOCK`` (útil en pruebas o configuraciones por tenant).
     Si la operación dejaría existencias negativas y el flag está desactivado,
     se lanza ``InsufficientStockError`` y no se persiste nada.
+
+    ``commit=False`` deja el movimiento y el saldo en la transacción abierta
+    para que otro módulo (por ejemplo, ``sales``) confirme varias operaciones
+    bajo un único ``COMMIT``. Ante cualquier error el método revierte la
+    transacción completa, incluidas las operaciones previas del llamador.
     """
     _validate_movement_shape(data)
     allow_negative = _resolve_allow_negative_stock(allow_negative_stock)
@@ -480,12 +486,14 @@ def create_stock_movement(
 
         movement = StockMovement(**data.model_dump())
         db.add(movement)
-        db.commit()
+        if commit:
+            db.commit()
     except Exception:
         db.rollback()
         raise
 
-    db.refresh(movement)
+    if commit:
+        db.refresh(movement)
     return movement
 
 

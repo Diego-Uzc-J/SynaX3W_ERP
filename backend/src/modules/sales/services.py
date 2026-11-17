@@ -28,7 +28,14 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
-from src.modules.inventory.models import Product
+from src.modules.inventory import services as inventory_services
+from src.modules.inventory.models import (
+    MovementType,
+    Product,
+    StockMovement,
+    Warehouse,
+)
+from src.modules.inventory.schemas import StockMovementCreate
 from src.modules.sales.models import (
     Customer,
     Invoice,
@@ -49,10 +56,13 @@ __all__ = [
     "CreditLimitExceededError",
     "DuplicateResourceError",
     "InactiveCustomerError",
+    "InsufficientStockForOrderError",
     "InvalidOrderDataError",
     "InvalidOrderStateError",
     "ResourceNotFoundError",
     "SalesServiceError",
+    "cancel_sales_order",
+    "confirm_sales_order",
     "create_customer",
     "create_sales_order",
     "deactivate_customer",
@@ -149,6 +159,32 @@ class CreditLimitExceededError(SalesServiceError):
         )
 
 
+class InsufficientStockForOrderError(SalesServiceError):
+    """El despacho no puede completarse por falta de existencias."""
+
+    status_code = 400
+
+    def __init__(
+        self,
+        *,
+        order_code: str,
+        product_id: int,
+        warehouse_id: int,
+        available: int,
+        requested: int,
+    ) -> None:
+        self.order_code = order_code
+        self.product_id = product_id
+        self.warehouse_id = warehouse_id
+        self.available = available
+        self.requested = requested
+        super().__init__(
+            f"Stock insuficiente para confirmar el pedido {order_code}: "
+            f"producto {product_id} en bodega {warehouse_id}, "
+            f"disponible {available}, solicitado {requested}"
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Utilidades internas
 # --------------------------------------------------------------------------- #
@@ -222,9 +258,25 @@ def _get_customer(db: Session, customer_id: int) -> Customer:
     return customer
 
 
-def _get_active_customer(db: Session, customer_id: int) -> Customer:
-    """Obtiene un cliente y exige que esté activo para operar."""
-    customer = _get_customer(db, customer_id)
+def _get_active_customer(
+    db: Session, customer_id: int, *, for_update: bool = False
+) -> Customer:
+    """Obtiene un cliente y exige que esté activo para operar.
+
+    ``for_update=True`` bloquea la fila del cliente para serializar las
+    comprobaciones de crédito concurrentes durante la confirmación.
+    """
+    if for_update:
+        customer = db.scalars(
+            select(Customer)
+            .where(Customer.id == customer_id)
+            .with_for_update()
+        ).first()
+        if customer is None:
+            raise ResourceNotFoundError(f"Cliente {customer_id} no encontrado")
+    else:
+        customer = _get_customer(db, customer_id)
+
     if not customer.is_active:
         raise InactiveCustomerError(
             "No se pueden crear transacciones comerciales para el cliente "
@@ -327,6 +379,155 @@ def _next_order_code(db: Session, year: int) -> str:
         if suffix.isdigit():
             max_sequence = max(max_sequence, int(suffix))
     return f"{prefix}{max_sequence + 1:04d}"
+
+
+def _resolve_dispatch_warehouse(
+    db: Session, warehouse_id: int | None
+) -> Warehouse:
+    """Resuelve la bodega de despacho del pedido.
+
+    La entidad ``SalesOrder`` no persiste una bodega (la especificación de
+    ventas solo menciona la "bodega designada"). Si el llamador no la indica,
+    se usa la única bodega activa; con varias activas se exige elegir una para
+    evitar despachos ambiguos.
+    """
+    if warehouse_id is not None:
+        warehouse = db.get(Warehouse, warehouse_id)
+        if warehouse is None:
+            raise ResourceNotFoundError(
+                f"Bodega {warehouse_id} no encontrada"
+            )
+        if not warehouse.is_active:
+            raise InvalidOrderDataError(
+                f"La bodega {warehouse_id} está inactiva y no puede despachar"
+            )
+        return warehouse
+
+    active = list(
+        db.scalars(
+            select(Warehouse)
+            .where(Warehouse.is_active.is_(True))
+            .order_by(Warehouse.id)
+            .limit(2)
+        )
+    )
+    if not active:
+        raise InvalidOrderDataError(
+            "No hay bodegas activas para despachar el pedido"
+        )
+    if len(active) > 1:
+        raise InvalidOrderDataError(
+            "Hay varias bodegas activas; especifique 'warehouse_id' "
+            "para despachar el pedido"
+        )
+    return active[0]
+
+
+def _register_outbound(
+    db: Session,
+    *,
+    order_code: str,
+    item: SalesOrderItem,
+    warehouse_id: int,
+    created_by: str,
+) -> StockMovement:
+    """Registra la salida de una línea dentro de la transacción del pedido."""
+    payload = StockMovementCreate(
+        product_id=item.product_id,
+        movement_type=MovementType.OUTBOUND,
+        warehouse_source_id=warehouse_id,
+        quantity=item.quantity,
+        reference_document=order_code,
+        notes=f"Despacho del pedido {order_code}",
+        created_by=created_by,
+    )
+    try:
+        return inventory_services.create_stock_movement(
+            db,
+            payload,
+            allow_negative_stock=False,
+            commit=False,
+        )
+    except inventory_services.InsufficientStockError as exc:
+        raise InsufficientStockForOrderError(
+            order_code=order_code,
+            product_id=exc.product_id,
+            warehouse_id=exc.warehouse_id,
+            available=exc.available,
+            requested=exc.requested,
+        ) from exc
+    except inventory_services.ResourceNotFoundError as exc:
+        raise ResourceNotFoundError(str(exc)) from exc
+    except inventory_services.InventoryError as exc:
+        raise InvalidOrderDataError(
+            f"No se pudo registrar la salida del pedido {order_code}: {exc}"
+        ) from exc
+
+
+def _order_has_invoices(db: Session, order_id: int) -> bool:
+    """Indica si el pedido ya tiene algún documento fiscal asociado."""
+    stmt = select(Invoice.id).where(Invoice.sales_order_id == order_id).limit(1)
+    return db.execute(stmt).first() is not None
+
+
+def _reverse_order_dispatch(
+    db: Session,
+    order: SalesOrder,
+    *,
+    reason: str | None,
+    created_by: str,
+) -> None:
+    """Revierte el despacho con movimientos ``INBOUND`` de contrapartida.
+
+    No se modifican ni eliminan los ``OUTBOUND`` originales: el historial de
+    inventario es inmutable. Se registra una entrada por cada salida vinculada
+    al código del pedido, dentro de la misma transacción de la cancelación.
+    """
+    movements = list(
+        db.scalars(
+            select(StockMovement)
+            .where(
+                StockMovement.reference_document == order.code,
+                StockMovement.movement_type == MovementType.OUTBOUND,
+            )
+            .order_by(StockMovement.id)
+        )
+    )
+    if not movements:
+        raise InvalidOrderStateError(
+            f"El pedido {order.code} está CONFIRMED pero no tiene movimientos "
+            "OUTBOUND que puedan revertirse"
+        )
+
+    note = f"Reversión por cancelación del pedido {order.code}"
+    if reason:
+        note = f"{note}: {reason}"
+
+    for movement in movements:
+        source_id = movement.warehouse_source_id
+        if source_id is None:
+            raise InvalidOrderStateError(
+                "El movimiento OUTBOUND "
+                f"{movement.id} no tiene bodega de origen"
+            )
+        payload = StockMovementCreate(
+            product_id=movement.product_id,
+            movement_type=MovementType.INBOUND,
+            warehouse_destination_id=source_id,
+            quantity=movement.quantity,
+            reference_document=order.code,
+            notes=note,
+            created_by=created_by,
+        )
+        try:
+            inventory_services.create_stock_movement(
+                db, payload, commit=False
+            )
+        except inventory_services.InventoryError as exc:
+            raise InvalidOrderDataError(
+                "No se pudo revertir el despacho del pedido "
+                f"{order.code}: {exc}"
+            ) from exc
 
 
 # --------------------------------------------------------------------------- #
@@ -471,13 +672,22 @@ def create_sales_order(db: Session, data: SalesOrderCreate) -> SalesOrder:
     return order
 
 
-def get_sales_order(db: Session, order_id: int) -> SalesOrder:
-    """Obtiene un pedido con sus líneas o lanza ``ResourceNotFoundError``."""
+def get_sales_order(
+    db: Session, order_id: int, *, for_update: bool = False
+) -> SalesOrder:
+    """Obtiene un pedido con sus líneas o lanza ``ResourceNotFoundError``.
+
+    ``for_update=True`` bloquea la fila del pedido para que las transiciones de
+    estado (confirmación/cancelación) sean serializables y no descuenten stock
+    dos veces ante solicitudes concurrentes.
+    """
     stmt = (
         select(SalesOrder)
         .where(SalesOrder.id == order_id)
         .options(selectinload(SalesOrder.items))
     )
+    if for_update:
+        stmt = stmt.with_for_update()
     order = db.scalars(stmt).first()
     if order is None:
         raise ResourceNotFoundError(f"Pedido {order_id} no encontrado")
@@ -560,6 +770,149 @@ def update_sales_order(
         db,
         duplicate_message=f"Ya existe un pedido con el código '{order.code}'",
     )
+    db.refresh(order)
+    return order
+
+
+def confirm_sales_order(
+    db: Session,
+    order_id: int,
+    *,
+    warehouse_id: int | None = None,
+    created_by: str = "sales",
+) -> SalesOrder:
+    """Confirma un pedido y despacha su inventario en una sola transacción.
+
+    Reglas aplicadas:
+
+    - solo transicionan ``DRAFT`` y ``QUOTATION``; un pedido ya ``CONFIRMED``
+      se devuelve sin volver a descontar stock (idempotencia);
+    - el cliente debe estar activo y el total del pedido debe caber en su
+      ``credit_limit`` (regla 1 de ``specs/sales_spec.md``);
+    - se registra un movimiento ``OUTBOUND`` por cada línea del pedido en la
+      bodega resuelta y se prohíbe stock negativo;
+    - si cualquier línea falla, se revierte la transacción completa: no queda
+      ni el cambio de estado ni movimientos parciales (ACID).
+
+    ``warehouse_id`` permite elegir la bodega de despacho; si se omite se usa
+    la única bodega activa (con varias activas se exige indicarla).
+    """
+    order = get_sales_order(db, order_id, for_update=True)
+
+    if order.status == SalesOrderStatus.CONFIRMED:
+        # No-op idempotente: libera el bloqueo sin persistir cambios.
+        db.rollback()
+        return get_sales_order(db, order_id)
+
+    if order.status not in _EDITABLE_STATUSES:
+        code = order.code
+        status = order.status.value
+        db.rollback()
+        raise InvalidOrderStateError(
+            f"El pedido '{code}' está en estado {status} y "
+            "solo puede confirmarse desde DRAFT o QUOTATION"
+        )
+
+    if not order.items:
+        code = order.code
+        db.rollback()
+        raise InvalidOrderStateError(
+            f"El pedido '{code}' no tiene líneas para despachar"
+        )
+
+    try:
+        # El bloqueo del cliente serializa confirmaciones concurrentes del
+        # mismo cliente para que la suma de crédito sea consistente.
+        _get_active_customer(db, order.customer_id, for_update=True)
+        validate_order_credit(db, order)
+        warehouse = _resolve_dispatch_warehouse(db, warehouse_id)
+
+        for item in order.items:
+            _register_outbound(
+                db,
+                order_code=order.code,
+                item=item,
+                warehouse_id=warehouse.id,
+                created_by=created_by,
+            )
+
+        order.status = SalesOrderStatus.CONFIRMED
+        db.commit()
+    except Exception:
+        # ``create_stock_movement`` ya revierte ante errores de stock; este
+        # rollback cubre cualquier fallo posterior y deja la sesión limpia.
+        db.rollback()
+        raise
+
+    db.refresh(order)
+    return order
+
+
+def cancel_sales_order(
+    db: Session,
+    order_id: int,
+    *,
+    reason: str | None = None,
+    created_by: str = "sales",
+) -> SalesOrder:
+    """Cancela un pedido respetando la inmutabilidad logística y financiera.
+
+    - un pedido ya ``CANCELLED`` se devuelve sin cambios (idempotencia);
+    - ``FULFILLED`` no se cancela: la entrega ya se completó;
+    - si existe cualquier factura asociada se rechaza la cancelación, porque
+      la corrección debe hacerse con anulación (``VOID``) o nota crédito;
+    - en ``CONFIRMED`` se revierte el despacho con movimientos ``INBOUND`` de
+      contrapartida por cada ``OUTBOUND`` del pedido. Los movimientos
+      originales nunca se modifican ni eliminan (``PROJECT_MANIFEST.md``);
+    - en ``DRAFT``/``QUOTATION`` solo cambia el estado.
+
+    La reversión y el cambio de estado se confirman en un único ``COMMIT``.
+    """
+    order = get_sales_order(db, order_id, for_update=True)
+
+    if order.status == SalesOrderStatus.CANCELLED:
+        # No-op idempotente: libera el bloqueo sin persistir cambios.
+        db.rollback()
+        return get_sales_order(db, order_id)
+
+    if order.status == SalesOrderStatus.FULFILLED:
+        code = order.code
+        db.rollback()
+        raise InvalidOrderStateError(
+            f"El pedido '{code}' ya fue FULFILLED y no puede cancelarse"
+        )
+
+    if order.status not in (
+        SalesOrderStatus.DRAFT,
+        SalesOrderStatus.QUOTATION,
+        SalesOrderStatus.CONFIRMED,
+    ):
+        code = order.code
+        status = order.status.value
+        db.rollback()
+        raise InvalidOrderStateError(
+            f"El pedido '{code}' está en estado {status} y no puede cancelarse"
+        )
+
+    try:
+        if _order_has_invoices(db, order.id):
+            raise InvalidOrderStateError(
+                f"El pedido '{order.code}' tiene facturas asociadas; debe "
+                "anularse la factura (VOID) o emitir una nota crédito en "
+                "lugar de cancelar el pedido"
+            )
+
+        if order.status == SalesOrderStatus.CONFIRMED:
+            _reverse_order_dispatch(
+                db, order, reason=reason, created_by=created_by
+            )
+
+        order.status = SalesOrderStatus.CANCELLED
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
     db.refresh(order)
     return order
 
