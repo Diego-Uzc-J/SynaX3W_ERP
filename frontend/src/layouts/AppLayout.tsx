@@ -48,14 +48,20 @@ export default function AppLayout() {
   );
   const isInventoryReadOnly =
     user !== null && !canWriteModule(user, "inventory");
+  // Las rutas sales exigen además el rol `sales` (o administrador); ocultar
+  // los enlaces evita mostrar destinos que el router rechazaría con 403.
+  const canOpenSales =
+    sales !== undefined &&
+    user !== null &&
+    (user.role.name === "administrator" || user.role.name === "sales");
 
   const mobileLinks = [
     ...(inventory === undefined
       ? []
       : INVENTORY_LINKS.map((link) => ({ to: link.to, label: link.label }))),
-    ...(sales === undefined
-      ? []
-      : SALES_LINKS.map((link) => ({ to: link.to, label: link.label }))),
+    ...(canOpenSales
+      ? SALES_LINKS.map((link) => ({ to: link.to, label: link.label }))
+      : []),
     ...otherModules.map((module) => ({
       to: module.path,
       label: module.label,
@@ -114,7 +120,7 @@ export default function AppLayout() {
               </>
             )}
 
-            {sales === undefined ? null : (
+            {canOpenSales && sales !== undefined ? (
               <>
                 <SectionLabel>{sales.label}</SectionLabel>
                 {SALES_LINKS.map((item) => (
@@ -133,7 +139,7 @@ export default function AppLayout() {
                   </NavLink>
                 ))}
               </>
-            )}
+            ) : null}
 
             {otherModules.length === 0 ? null : (
               <>
