@@ -4,6 +4,7 @@ import { initials, ROLE_LABELS } from "../modules/users/constants";
 import {
   accessibleModules,
   INVENTORY_LINKS,
+  PURCHASING_LINKS,
   SALES_LINKS,
 } from "../routes/modules";
 import { canWriteModule, logout, useAuth } from "../store/authStore";
@@ -39,11 +40,13 @@ export default function AppLayout() {
   const modules = user === null ? [] : accessibleModules(user);
   const inventory = modules.find((module) => module.key === "inventory");
   const sales = modules.find((module) => module.key === "sales");
+  const purchasing = modules.find((module) => module.key === "purchasing");
   const users = modules.find((module) => module.key === "users");
   const otherModules = modules.filter(
     (module) =>
       module.key !== "inventory" &&
       module.key !== "sales" &&
+      module.key !== "purchasing" &&
       module.key !== "users",
   );
   const isInventoryReadOnly =
@@ -54,6 +57,11 @@ export default function AppLayout() {
     sales !== undefined &&
     user !== null &&
     (user.role.name === "administrator" || user.role.name === "sales");
+  // Igual que en ventas, las rutas exigen además el rol `purchasing`.
+  const canOpenPurchasing =
+    purchasing !== undefined &&
+    user !== null &&
+    (user.role.name === "administrator" || user.role.name === "purchasing");
 
   const mobileLinks = [
     ...(inventory === undefined
@@ -61,6 +69,9 @@ export default function AppLayout() {
       : INVENTORY_LINKS.map((link) => ({ to: link.to, label: link.label }))),
     ...(canOpenSales
       ? SALES_LINKS.map((link) => ({ to: link.to, label: link.label }))
+      : []),
+    ...(canOpenPurchasing
+      ? PURCHASING_LINKS.map((link) => ({ to: link.to, label: link.label }))
       : []),
     ...otherModules.map((module) => ({
       to: module.path,
@@ -124,6 +135,27 @@ export default function AppLayout() {
               <>
                 <SectionLabel>{sales.label}</SectionLabel>
                 {SALES_LINKS.map((item) => (
+                  <NavLink
+                    key={item.to}
+                    to={item.to}
+                    end
+                    className={({ isActive }) => navItemClass(isActive)}
+                  >
+                    <span className="block text-sm font-semibold lg:text-[0.8125rem]">
+                      {item.label}
+                    </span>
+                    <span className="hidden text-xs text-concrete-400 lg:block">
+                      {item.description}
+                    </span>
+                  </NavLink>
+                ))}
+              </>
+            ) : null}
+
+            {canOpenPurchasing && purchasing !== undefined ? (
+              <>
+                <SectionLabel>{purchasing.label}</SectionLabel>
+                {PURCHASING_LINKS.map((item) => (
                   <NavLink
                     key={item.to}
                     to={item.to}

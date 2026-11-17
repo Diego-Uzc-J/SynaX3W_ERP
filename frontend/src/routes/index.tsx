@@ -4,6 +4,8 @@ import AppLayout from "../layouts/AppLayout";
 import InventoryPage from "../modules/inventory/InventoryPage";
 import ProductList from "../modules/inventory/ProductList";
 import WarehouseList from "../modules/inventory/WarehouseList";
+import PurchaseOrderList from "../modules/purchasing/PurchaseOrderList";
+import SupplierList from "../modules/purchasing/SupplierList";
 import CustomerList from "../modules/sales/CustomerList";
 import InvoiceDetail from "../modules/sales/InvoiceDetail";
 import InvoiceList from "../modules/sales/InvoiceList";
@@ -72,8 +74,26 @@ export const router = createBrowserRouter([
             element: <RequireModule module="purchasing" />,
             children: [
               {
-                path: "purchasing",
-                element: <ModulePlaceholder module="purchasing" />,
+                element: (
+                  <RequireRole
+                    roles={["purchasing", "administrator"]}
+                    module="purchasing"
+                  />
+                ),
+                children: [
+                  {
+                    path: "purchasing",
+                    element: <Navigate to="/purchasing/suppliers" replace />,
+                  },
+                  {
+                    path: "purchasing/suppliers",
+                    element: <SupplierList />,
+                  },
+                  {
+                    path: "purchasing/orders",
+                    element: <PurchaseOrderList />,
+                  },
+                ],
               },
             ],
           },
