@@ -15,6 +15,7 @@ from sqlalchemy import engine_from_config, pool
 
 from src.core.database import Base, DATABASE_URL
 from src.modules.inventory import models as inventory_models  # noqa: F401
+from src.modules.sales import models as sales_models  # noqa: F401
 from src.modules.users import models as users_models  # noqa: F401
 
 # Objeto de configuración de Alembic.
