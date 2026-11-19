@@ -134,8 +134,15 @@ class Account(Base):
     parent: Mapped[Account | None] = relationship(
         remote_side=[id], back_populates="children"
     )
-    children: Mapped[list[Account]] = relationship(back_populates="parent")
-    journal_items: Mapped[list[JournalItem]] = relationship(back_populates="account")
+    # ``passive_deletes=True`` evita que SQLAlchemy intente desvincular hijos o
+    # líneas (UPDATE ... SET NULL) antes del DELETE: la FK es RESTRICT y la
+    # validación de borrado vive en el servicio y en los listeners del servicio.
+    children: Mapped[list[Account]] = relationship(
+        back_populates="parent", passive_deletes=True
+    )
+    journal_items: Mapped[list[JournalItem]] = relationship(
+        back_populates="account", passive_deletes=True
+    )
 
     def __repr__(self) -> str:  # pragma: no cover - ayuda de depuración
         return f"<Account id={self.id!r} code={self.code!r} type={self.account_type!r}>"
