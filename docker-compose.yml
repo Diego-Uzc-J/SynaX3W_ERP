@@ -54,4 +54,4 @@ services:
 volumes:
   postgres_data:
     external: true
-    name: synaxcor3_erp_postgres_data
+    name: synapsisxcor3_erp_postgres_data
