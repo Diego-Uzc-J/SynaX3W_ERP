@@ -1,7 +1,7 @@
 """Servicios de dominio del módulo de Finanzas y Contabilidad.
 
 Implementa el Hito 3 de ``specs/accounting_spec.md`` para el Plan de Cuentas y
-el libro diario:
+el libro diario, y los hitos 4-5 de automatización contable y cartera:
 
 * **Cuentas:** alta con ``code`` único, listado filtrable, actualización parcial,
   desactivación (borrado lógico) y bloqueo de borrado físico cuando la cuenta
@@ -15,19 +15,28 @@ el libro diario:
 * **Inmutabilidad y contrapartidas:** los asientos ``POSTED`` no se editan ni se
   borran; los borradores pueden anularse (``VOID``) y los publicados se corrigen
   con un asiento de reversión trazable (regla 2).
+* **Automatización:** ``post_sales_invoice_accounting``,
+  ``post_sales_credit_note_accounting``, ``post_purchase_receipt_accounting`` y
+  ``post_supplier_bill_accounting`` convierten documentos de ``sales`` y
+  ``purchasing`` en asientos ``POSTED`` y en CxC/CxP (regla 3).
+* **Cartera:** ``register_receivable_payment`` y ``register_payable_payment``
+  validan el saldo pendiente, actualizan ``paid_amount``, transicionan el estado
+  y dejan un ``PaymentRecord`` con su asiento (reglas 5, 8 y 9 de la spec de
+  aceptación).
 
 Toda operación de escritura usa :func:`_atomic`, que confirma al finalizar y
-hace ``rollback`` ante cualquier excepción, de modo que un asiento desbalanceado
-o con una cuenta inactiva no deja registros parciales. Las excepciones derivan
-de ``fastapi.HTTPException`` con ``status_code`` 400/404/409, igual que en
-``sales`` y ``purchasing``.
+hace ``rollback`` ante cualquier excepción, de modo que un asiento desbalanceado,
+una cuenta inactiva o un fallo al actualizar un saldo no dejan registros
+parciales. Las excepciones derivan de ``fastapi.HTTPException`` con
+``status_code`` 400/404/409, igual que en ``sales`` y ``purchasing``.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterator, Sequence
-from contextlib import contextmanager
-from datetime import date, datetime, timezone
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
@@ -37,10 +46,14 @@ from sqlalchemy.orm import Session, selectinload
 
 from src.modules.accounting.models import (
     Account,
+    AccountBalanceStatus,
+    AccountPayable,
+    AccountReceivable,
     AccountingPeriod,
     JournalEntry,
     JournalEntryStatus,
     JournalItem,
+    PaymentRecord,
 )
 from src.modules.accounting.schemas import (
     AccountCreate,
@@ -48,18 +61,31 @@ from src.modules.accounting.schemas import (
     JournalEntryCreate,
     JournalEntryPostResponse,
     JournalItemCreate,
+    PaymentCreate,
 )
+from src.modules.purchasing.models import (
+    GoodsReceipt,
+    GoodsReceiptItem,
+    Supplier,
+    SupplierBill,
+)
+from src.modules.sales.models import CreditNote, Invoice
 
 __all__ = [
     "AccountInUseError",
+    "AccountingAccounts",
+    "AccountingError",
     "AccountingServiceError",
+    "AccountingResult",
     "ClosedAccountingPeriodError",
     "DuplicateResourceError",
     "ImmutableJournalEntryError",
     "InactiveAccountError",
     "InvalidJournalEntryError",
     "InvalidJournalEntryStateError",
+    "InvalidSourceDocumentError",
     "ParentCycleError",
+    "PaymentResult",
     "ResourceNotFoundError",
     "UnbalancedJournalEntryError",
     "build_journal_entry_post_response",
@@ -70,10 +96,21 @@ __all__ = [
     "delete_journal_entry",
     "ensure_account_active",
     "get_account",
+    "get_account_payable",
+    "get_account_receivable",
     "get_journal_entry",
+    "list_account_payables",
+    "list_account_receivables",
     "list_accounts",
     "list_journal_entries",
+    "list_payment_records",
     "post_journal_entry",
+    "post_purchase_receipt_accounting",
+    "post_sales_credit_note_accounting",
+    "post_sales_invoice_accounting",
+    "post_supplier_bill_accounting",
+    "register_payable_payment",
+    "register_receivable_payment",
     "reverse_journal_entry",
     "reject_journal_entry_mutation",
     "update_account",
@@ -89,6 +126,30 @@ _MAX_MONEY = Decimal("999999999999.99")
 
 #: Clave base del advisory lock que serializa la secuencia ``REV-YYYY-XXXX``.
 _REVERSAL_CODE_LOCK_BASE = 8_400_000
+
+#: Bases distintas para que cada prefijo automático tenga su propia secuencia.
+_AUTO_CODE_LOCK_BASES: dict[str, int] = {
+    "ASI-FAC": 8_410_000,
+    "ASI-NC": 8_410_100,
+    "ASI-REC": 8_410_200,
+    "ASI-FCP": 8_410_300,
+    "ASI-COB": 8_410_400,
+    "ASI-PAG": 8_410_500,
+}
+
+#: Mapeo por defecto de roles contables a códigos del PUC. Se usa solo cuando el
+#: llamador no pasa el id de la cuenta; cualquier PUC puede sobrescribirlo.
+DEFAULT_ACCOUNT_CODES: dict[str, str] = {
+    "receivable": "130505",  # Clientes
+    "revenue": "4135",  # Ventas
+    "output_tax": "240805",  # IVA generado / por pagar
+    "inventory": "1435",  # Inventario de mercancías
+    "expense": "5100",  # Costo de ventas / gastos de compra
+    "input_tax": "135515",  # IVA descontable
+    "payable": "220505",  # Proveedores
+    "cash": "110505",  # Caja General
+    "bank": "111005",  # Bancos
+}
 
 #: Transiciones permitidas desde un borrador.
 _DRAFT_TRANSITIONS = frozenset(
@@ -187,6 +248,62 @@ class ImmutableJournalEntryError(AccountingServiceError):
     """Un asiento publicado no puede modificarse ni eliminarse (regla 2)."""
 
     status_code = 400
+
+
+class InvalidSourceDocumentError(AccountingServiceError):
+    """El documento de ``sales``/``purchasing`` no puede contabilizarse."""
+
+    status_code = 400
+
+
+class AccountingError(AccountingServiceError):
+    """Falta configuración contable necesaria para la integración."""
+
+    status_code = 400
+
+
+# --------------------------------------------------------------------------- #
+# Resultados públicos de la automatización y la cartera
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class AccountingResult:
+    """Asiento publicado y saldo auxiliar afectado por una integración."""
+
+    journal_entry: JournalEntry
+    balance: AccountReceivable | AccountPayable | None = None
+
+
+@dataclass(frozen=True)
+class PaymentResult:
+    """Asiento, registro de pago y saldo actualizado tras un cobro o pago."""
+
+    journal_entry: JournalEntry
+    payment: PaymentRecord
+    balance: AccountReceivable | AccountPayable
+
+
+@dataclass(frozen=True)
+class AccountingAccounts:
+    """Cuentas del PUC usadas por la automatización contable.
+
+    Todos los campos son opcionales: cuando se omite un id, el servicio intenta
+    resolverlo por el código configurable en :data:`DEFAULT_ACCOUNT_CODES`. Los
+    campos ``output_tax``/``input_tax`` también pueden omitirse; en ese caso el
+    impuesto se integra en la línea de ingresos o de gasto para conservar la
+    partida doble.
+    """
+
+    receivable: int | None = None
+    revenue: int | None = None
+    output_tax: int | None = None
+    inventory: int | None = None
+    expense: int | None = None
+    input_tax: int | None = None
+    payable: int | None = None
+    cash: int | None = None
+    bank: int | None = None
 
 
 # --------------------------------------------------------------------------- #
@@ -435,6 +552,263 @@ def _next_reversal_code(db: Session, year: int) -> str:
         if suffix.isdigit():
             max_sequence = max(max_sequence, int(suffix))
     return f"{prefix}{max_sequence + 1:04d}"
+
+
+# --------------------------------------------------------------------------- #
+# Soporte transversal para integraciones y cartera
+# --------------------------------------------------------------------------- #
+
+
+@contextmanager
+def _unit_of_work(db: Session, *, commit: bool) -> Iterator[None]:
+    """Aísla la frontera de commit para permitir llamadas desde otros módulos.
+
+    Los servicios de ``sales``/``purchasing`` pueden pasar ``commit=False`` para
+    incluir la contabilización en su propia transacción. Por defecto la función
+    pública confirma y revierte por sí misma.
+    """
+    if commit:
+        with _atomic(db):
+            yield
+    else:
+        yield
+
+
+def _resolve_account_id(
+    db: Session, role: str, explicit_id: int | None, *, required: bool = True
+) -> int | None:
+    """Resuelve una cuenta por id explícito o por el código PUC por defecto."""
+    if explicit_id is not None:
+        return explicit_id
+    code = DEFAULT_ACCOUNT_CODES[role]
+    account = db.scalar(select(Account).where(Account.code == code))
+    if account is not None:
+        return account.id
+    if required:
+        raise AccountingError(
+            f"Falta la cuenta '{role}' del PUC: configure el código '{code}' o "
+            f"pase el parámetro '{role}_account_id'"
+        )
+    return None
+
+
+def _next_auto_code(db: Session, *, prefix: str, year: int) -> str:
+    """Genera ``ASI-XXX-YYYY-XXXX`` con una secuencia serializada por prefijo."""
+    _lock_sequence(
+        db, base=_AUTO_CODE_LOCK_BASES[prefix], year=year
+    )
+    pattern = f"{prefix}-{year}-%"
+    rows = db.scalars(
+        select(JournalEntry.code).where(JournalEntry.code.like(pattern))
+    ).all()
+    marker = f"{prefix}-{year}-"
+    max_sequence = 0
+    for code in rows:
+        suffix = code[len(marker) :]
+        if suffix.isdigit():
+            max_sequence = max(max_sequence, int(suffix))
+    return f"{marker}{max_sequence + 1:04d}"
+
+
+def _find_generated_entry(
+    db: Session, *, reference: str, label: str
+) -> JournalEntry | None:
+    """Localiza el asiento generado antes para un mismo documento."""
+    return db.scalars(
+        select(JournalEntry)
+        .options(selectinload(JournalEntry.items))
+        .where(
+            JournalEntry.reference_document == reference,
+            JournalEntry.description.like(f"{label}%"),
+            JournalEntry.status == JournalEntryStatus.POSTED,
+        )
+        .order_by(JournalEntry.id)
+        .limit(1)
+    ).first()
+
+
+def _ensure_entry_postable(db: Session, entry: JournalEntry) -> None:
+    """Reúne las validaciones comunes antes de fijar ``POSTED``."""
+    _ensure_accounts_available(db, [item.account_id for item in entry.items])
+    _ensure_open_period(db, entry.entry_date)
+    _ensure_balanced(entry)
+
+
+def _build_posted_entry(
+    db: Session,
+    *,
+    code: str,
+    entry_date: date,
+    description: str,
+    reference_document: str | None,
+    created_by: str | None,
+    items: Sequence[JournalItemCreate],
+) -> JournalEntry:
+    """Construye un asiento ``POSTED`` validado sin hacer commit."""
+    _ensure_unique_entry_code(db, code)
+    entry = JournalEntry(
+        code=code,
+        entry_date=entry_date,
+        description=description,
+        reference_document=reference_document,
+        status=JournalEntryStatus.POSTED,
+        posted_at=datetime.now(timezone.utc),
+        created_by=created_by,
+        items=_build_items(db, items),
+    )
+    _ensure_entry_postable(db, entry)
+    # No se añade a la sesión aquí: las validaciones consultan la BD y un
+    # autoflush anticipado convertiría el primer INSERT en un UPDATE, que la
+    # regla de inmutabilidad rechazaría. Cada llamador lo añade tras enlazar
+    # las relaciones con la CxC/CxP o el PaymentRecord.
+    return entry
+
+
+def _get_document(db: Session, model: Any, document_id: int, label: str) -> Any:
+    """Obtiene un documento por id o lanza ``ResourceNotFoundError``."""
+    document = db.get(model, document_id)
+    if document is None:
+        raise ResourceNotFoundError(f"{label} {document_id} no encontrado")
+    return document
+
+
+def _get_invoice(db: Session, invoice_id: int) -> Invoice:
+    """Obtiene una factura junto con el pedido que originó sus impuestos."""
+    invoice = db.scalars(
+        select(Invoice)
+        .options(selectinload(Invoice.sales_order))
+        .where(Invoice.id == invoice_id)
+    ).first()
+    if invoice is None:
+        raise ResourceNotFoundError(f"Factura {invoice_id} no encontrada")
+    return invoice
+
+
+def _get_credit_note(db: Session, credit_note_id: int) -> CreditNote:
+    """Obtiene una nota crédito junto con su factura de origen."""
+    note = db.scalars(
+        select(CreditNote)
+        .options(selectinload(CreditNote.invoice))
+        .where(CreditNote.id == credit_note_id)
+    ).first()
+    if note is None:
+        raise ResourceNotFoundError(f"Nota crédito {credit_note_id} no encontrada")
+    return note
+
+
+def _get_receipt(db: Session, receipt_id: int) -> GoodsReceipt:
+    """Obtiene una recepción con sus líneas, pedido y proveedor."""
+    receipt = db.scalars(
+        select(GoodsReceipt)
+        .options(
+            selectinload(GoodsReceipt.items).selectinload(
+                GoodsReceiptItem.order_item
+            ),
+            selectinload(GoodsReceipt.order),
+        )
+        .where(GoodsReceipt.id == receipt_id)
+    ).first()
+    if receipt is None:
+        raise ResourceNotFoundError(f"Recepción {receipt_id} no encontrada")
+    return receipt
+
+
+def _get_bill(db: Session, bill_id: int) -> SupplierBill:
+    """Obtiene una factura de proveedor por id."""
+    return _get_document(db, SupplierBill, bill_id, "Factura de proveedor")
+
+
+def _as_balance_status(value: Any) -> AccountBalanceStatus | Any:
+    """Normaliza un estado de cartera leído de la base de datos."""
+    if isinstance(value, AccountBalanceStatus):
+        return value
+    try:
+        return AccountBalanceStatus(value)
+    except (TypeError, ValueError):
+        return value
+
+
+def _get_receivable_by_invoice(
+    db: Session, invoice_id: int
+) -> AccountReceivable | None:
+    """Busca la CxC asociada a una factura de ventas."""
+    return db.scalar(
+        select(AccountReceivable).where(AccountReceivable.invoice_id == invoice_id)
+    )
+
+
+def _get_payable_by_reference(
+    db: Session, bill_reference: str
+) -> AccountPayable | None:
+    """Busca la CxP asociada a un documento de compras."""
+    return db.scalar(
+        select(AccountPayable).where(
+            AccountPayable.bill_reference == bill_reference
+        )
+    )
+
+
+def _recompute_balance_status(balance: AccountReceivable | AccountPayable) -> AccountBalanceStatus:
+    """Deriva el estado de la cartera a partir de ``paid_amount``."""
+    total = _money(balance.total_amount)
+    paid = _money(balance.paid_amount)
+    if paid >= total:
+        return AccountBalanceStatus.PAID
+    current = _as_balance_status(balance.status)
+    if current is AccountBalanceStatus.OVERDUE:
+        return AccountBalanceStatus.OVERDUE
+    if paid > 0:
+        return AccountBalanceStatus.PARTIALLY_PAID
+    return AccountBalanceStatus.PENDING
+
+
+def _apply_payment_to_balance(
+    balance: AccountReceivable | AccountPayable, amount: Decimal
+) -> None:
+    """Abona a una CxC/CxP y recalcula su estado (punto de rollback de pagos)."""
+    balance.paid_amount = _money(_money(balance.paid_amount) + amount)
+    if balance.paid_amount > _money(balance.total_amount):
+        raise InvalidSourceDocumentError(
+            "El abono acumulado supera el total de la cuenta de cartera"
+        )
+    balance.status = _recompute_balance_status(balance)
+
+
+def _sales_tax_amount(db: Session, invoice: Invoice) -> Decimal:
+    """Importe de impuesto de una factura, derivado de su pedido si existe."""
+    if invoice.sales_order is None:
+        return Decimal("0.00")
+    total = _money(invoice.total)
+    tax = _money(invoice.sales_order.tax_amount)
+    if tax <= 0 or tax > total:
+        return Decimal("0.00")
+    if _money(invoice.sales_order.total) != total:
+        return Decimal("0.00")
+    return tax
+
+
+def _receipt_amounts(receipt: GoodsReceipt) -> tuple[Decimal, Decimal, Decimal]:
+    """Devuelve ``(subtotal, impuesto, total)`` de las líneas recibidas."""
+    subtotal = Decimal("0.00")
+    tax = Decimal("0.00")
+    for line in receipt.items:
+        order_item = line.order_item
+        if order_item is None:
+            raise InvalidSourceDocumentError(
+                f"La línea {line.id} de la recepción no tiene línea de OC"
+            )
+        line_subtotal = _money(Decimal(line.quantity) * _money(order_item.unit_price))
+        line_tax = _money(line_subtotal * _as_decimal(order_item.tax_rate) / Decimal("100"))
+        subtotal += line_subtotal
+        tax += line_tax
+    return _money(subtotal), _money(tax), _money(subtotal + tax)
+
+
+def _supplier_due_date(db: Session, supplier_id: int, from_date: date) -> date:
+    """Fecha de vencimiento según los términos de pago del proveedor."""
+    supplier = db.get(Supplier, supplier_id)
+    days = supplier.payment_terms_days if supplier is not None else 30
+    return from_date + timedelta(days=days)
 
 
 # --------------------------------------------------------------------------- #
@@ -771,6 +1145,868 @@ def build_journal_entry_post_response(
         total_debit=total_debit,
         total_credit=total_credit,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Automatización contable desde sales — regla 3 de la spec
+# --------------------------------------------------------------------------- #
+
+#: Etiquetas ASCII de las descripciones para localizar asientos ya generados.
+_LABEL_INVOICE = "Factura venta"
+_LABEL_CREDIT_NOTE = "Nota credito"
+_LABEL_RECEIPT = "Recepcion compra"
+_LABEL_BILL = "Factura proveedor"
+_LABEL_RECEIVABLE_PAYMENT = "Cobro CxC"
+_LABEL_PAYABLE_PAYMENT = "Pago CxP"
+
+
+def _status_value(value: Any) -> Any:
+    """Devuelve el valor escalar de un enum nativo o de Python."""
+    return getattr(value, "value", value)
+
+
+def _upsert_receivable(
+    db: Session,
+    *,
+    invoice: Invoice,
+    entry: JournalEntry,
+    total_amount: Decimal,
+) -> AccountReceivable:
+    """Crea o sincroniza la CxC de una factura con el importe vigente."""
+    balance = _get_receivable_by_invoice(db, invoice.id)
+    if balance is None:
+        balance = AccountReceivable(
+            customer_id=invoice.customer_id,
+            invoice_id=invoice.id,
+            journal_entry=entry,
+            total_amount=_money(total_amount),
+            paid_amount=Decimal("0.00"),
+            due_date=invoice.due_date,
+            status=AccountBalanceStatus.PENDING,
+        )
+        db.add(balance)
+    else:
+        balance.total_amount = _money(total_amount)
+        if balance.journal_entry_id is None:
+            balance.journal_entry = entry
+        balance.status = _recompute_balance_status(balance)
+    return balance
+
+
+def post_sales_invoice_accounting(
+    db: Session,
+    invoice: int | Invoice,
+    *,
+    receivable_account_id: int | None = None,
+    revenue_account_id: int | None = None,
+    output_tax_account_id: int | None = None,
+    tax_account_id: int | None = None,
+    created_by: str | None = None,
+    commit: bool = True,
+) -> AccountingResult:
+    """Contabiliza una factura de ventas y registra su CxC en una transacción.
+
+    El asiento debita la cuenta de CxC por el total de la factura y acredita la
+    cuenta de ingresos por el neto. Si hay impuesto y se configura
+    ``output_tax_account_id`` (o el código PUC por defecto), el impuesto se
+    acredita en su propia línea; en caso contrario se integra en la línea de
+    ingresos para conservar la partida doble.
+
+    La operación es idempotente: si el documento ya tiene un asiento ``POSTED``
+    se devuelve ese asiento y su CxC sin duplicar movimientos.
+    """
+    document = _get_invoice(db, invoice) if isinstance(invoice, int) else invoice
+    if _status_value(document.status) == "VOID":
+        raise InvalidSourceDocumentError(
+            f"La factura '{document.code}' está anulada y no genera asiento"
+        )
+
+    total = _money(document.total)
+    if total <= 0:
+        raise InvalidSourceDocumentError(
+            f"La factura '{document.code}' no tiene un total contabilizable"
+        )
+
+    receivable_id = _resolve_account_id(db, "receivable", receivable_account_id)
+    revenue_id = _resolve_account_id(db, "revenue", revenue_account_id)
+    tax_id = _resolve_account_id(
+        db,
+        "output_tax",
+        output_tax_account_id or tax_account_id,
+        required=False,
+    )
+    tax = _sales_tax_amount(db, document) if tax_id is not None else Decimal("0.00")
+    net = _money(total - tax)
+
+    items = [
+        JournalItemCreate(
+            account_id=receivable_id,  # type: ignore[arg-type]
+            debit=total,
+            credit=Decimal("0.00"),
+            description=f"CxC factura {document.code}",
+        ),
+        JournalItemCreate(
+            account_id=revenue_id,  # type: ignore[arg-type]
+            debit=Decimal("0.00"),
+            credit=net,
+            description=f"Ingreso factura {document.code}",
+        ),
+    ]
+    if tax_id is not None and tax > 0:
+        items.append(
+            JournalItemCreate(
+                account_id=tax_id,
+                debit=Decimal("0.00"),
+                credit=tax,
+                description=f"Impuesto factura {document.code}",
+            )
+        )
+
+    with _unit_of_work(db, commit=commit):
+        existing = _find_generated_entry(
+            db, reference=document.code, label=_LABEL_INVOICE
+        )
+        if existing is not None:
+            return AccountingResult(
+                existing, _get_receivable_by_invoice(db, document.id)
+            )
+
+        code = _next_auto_code(db, prefix="ASI-FAC", year=document.issue_date.year)
+        entry = _build_posted_entry(
+            db,
+            code=code,
+            entry_date=document.issue_date,
+            description=f"{_LABEL_INVOICE} {document.code}",
+            reference_document=document.code,
+            created_by=created_by or "accounting-automation",
+            items=items,
+        )
+        balance = _upsert_receivable(
+            db, invoice=document, entry=entry, total_amount=total
+        )
+        # Se añade al final, con las relaciones ya enlazadas, para evitar que un
+        # autoflush durante las validaciones provoque un UPDATE del asiento.
+        db.add(entry)
+    if commit:
+        db.refresh(entry)
+        db.refresh(balance)
+    return AccountingResult(entry, balance)
+
+
+def post_sales_credit_note_accounting(
+    db: Session,
+    credit_note: int | CreditNote,
+    *,
+    receivable_account_id: int | None = None,
+    revenue_account_id: int | None = None,
+    output_tax_account_id: int | None = None,
+    tax_account_id: int | None = None,
+    created_by: str | None = None,
+    commit: bool = True,
+) -> AccountingResult:
+    """Contabiliza una nota crédito y reduce la CxC de la factura de origen.
+
+    El asiento debita ingresos (y el impuesto proporcional, si está configurado)
+    y acredita la cuenta de CxC. El ``total_amount`` de la CxC se reduce sin
+    borrar el historial de pagos; si ya estaba liquidada, el saldo queda en cero.
+    """
+    note = (
+        _get_credit_note(db, credit_note)
+        if isinstance(credit_note, int)
+        else credit_note
+    )
+    invoice = note.invoice
+    if invoice is None:
+        raise InvalidSourceDocumentError(
+            f"La nota crédito '{note.code}' no tiene factura de origen"
+        )
+
+    amount = _money(note.amount)
+    if amount <= 0:
+        raise InvalidSourceDocumentError(
+            f"La nota crédito '{note.code}' no tiene un importe válido"
+        )
+
+    receivable_id = _resolve_account_id(db, "receivable", receivable_account_id)
+    revenue_id = _resolve_account_id(db, "revenue", revenue_account_id)
+    tax_id = _resolve_account_id(
+        db,
+        "output_tax",
+        output_tax_account_id or tax_account_id,
+        required=False,
+    )
+    tax = Decimal("0.00")
+    if tax_id is not None:
+        tax = _sales_tax_amount(db, invoice)
+        invoice_total = _money(invoice.total)
+        if tax > 0 and invoice_total > 0:
+            tax = min(amount, _money(amount * tax / invoice_total))
+        else:
+            tax = Decimal("0.00")
+    net = _money(amount - tax)
+
+    items = [
+        JournalItemCreate(
+            account_id=revenue_id,  # type: ignore[arg-type]
+            debit=net,
+            credit=Decimal("0.00"),
+            description=f"Descuento nota crédito {note.code}",
+        ),
+        JournalItemCreate(
+            account_id=receivable_id,  # type: ignore[arg-type]
+            debit=Decimal("0.00"),
+            credit=amount,
+            description=f"CxC nota crédito {note.code}",
+        ),
+    ]
+    if tax_id is not None and tax > 0:
+        items.append(
+            JournalItemCreate(
+                account_id=tax_id,
+                debit=tax,
+                credit=Decimal("0.00"),
+                description=f"Impuesto nota crédito {note.code}",
+            )
+        )
+
+    with _unit_of_work(db, commit=commit):
+        existing = _find_generated_entry(
+            db, reference=note.code, label=_LABEL_CREDIT_NOTE
+        )
+        if existing is not None:
+            return AccountingResult(
+                existing, _get_receivable_by_invoice(db, invoice.id)
+            )
+
+        code = _next_auto_code(db, prefix="ASI-NC", year=note.issue_date.year)
+        entry = _build_posted_entry(
+            db,
+            code=code,
+            entry_date=note.issue_date,
+            description=f"{_LABEL_CREDIT_NOTE} {note.code}",
+            reference_document=note.code,
+            created_by=created_by or "accounting-automation",
+            items=items,
+        )
+        balance = _get_receivable_by_invoice(db, invoice.id)
+        if balance is None:
+            balance = AccountReceivable(
+                customer_id=invoice.customer_id,
+                invoice_id=invoice.id,
+                journal_entry=entry,
+                total_amount=max(
+                    Decimal("0.00"), _money(_money(invoice.total) - amount)
+                ),
+                paid_amount=Decimal("0.00"),
+                due_date=invoice.due_date,
+                status=AccountBalanceStatus.PENDING,
+            )
+            db.add(balance)
+        else:
+            balance.total_amount = max(
+                _money(balance.paid_amount),
+                _money(_money(balance.total_amount) - amount),
+            )
+            if balance.journal_entry_id is None:
+                balance.journal_entry = entry
+            balance.status = _recompute_balance_status(balance)
+        db.add(entry)
+    if commit:
+        db.refresh(entry)
+        db.refresh(balance)
+    return AccountingResult(entry, balance)
+
+
+def _resolve_purchase_accounts(
+    db: Session,
+    *,
+    inventory_account_id: int | None,
+    expense_account_id: int | None,
+    input_tax_account_id: int | None,
+    tax_account_id: int | None,
+    payable_account_id: int | None,
+) -> tuple[int, int | None, int]:
+    """Resuelve las cuentas de inventario/gasto, impuesto y por pagar."""
+    inventory_id = _resolve_account_id(
+        db, "inventory", inventory_account_id, required=False
+    )
+    expense_id = _resolve_account_id(
+        db, "expense", expense_account_id, required=False
+    )
+    if inventory_id is None and expense_id is None:
+        raise AccountingError(
+            "Falta la cuenta de inventario o gasto: configure el código del PUC "
+            "o pase inventory_account_id / expense_account_id"
+        )
+    debit_account_id = inventory_id or expense_id
+    tax_id = _resolve_account_id(
+        db, "input_tax", input_tax_account_id or tax_account_id, required=False
+    )
+    payable_id = _resolve_account_id(db, "payable", payable_account_id)
+    return debit_account_id, tax_id, payable_id  # type: ignore[return-value]
+
+
+def _upsert_payable(
+    db: Session,
+    *,
+    bill_reference: str,
+    supplier_id: int,
+    entry: JournalEntry,
+    total_amount: Decimal,
+    due_date: date,
+) -> AccountPayable:
+    """Crea o sincroniza la CxP de un documento de compras."""
+    balance = _get_payable_by_reference(db, bill_reference)
+    if balance is None:
+        balance = AccountPayable(
+            supplier_id=supplier_id,
+            bill_reference=bill_reference,
+            journal_entry=entry,
+            total_amount=_money(total_amount),
+            paid_amount=Decimal("0.00"),
+            due_date=due_date,
+            status=AccountBalanceStatus.PENDING,
+        )
+        db.add(balance)
+    else:
+        balance.total_amount = _money(total_amount)
+        if balance.journal_entry_id is None:
+            balance.journal_entry = entry
+        balance.status = _recompute_balance_status(balance)
+    return balance
+
+
+def post_purchase_receipt_accounting(
+    db: Session,
+    receipt: int | GoodsReceipt,
+    *,
+    inventory_account_id: int | None = None,
+    expense_account_id: int | None = None,
+    input_tax_account_id: int | None = None,
+    tax_account_id: int | None = None,
+    payable_account_id: int | None = None,
+    created_by: str | None = None,
+    commit: bool = True,
+) -> AccountingResult:
+    """Contabiliza una recepción de mercancía y abre su CxP.
+
+    El importe se deriva de las líneas recibidas (cantidad × precio de la OC y
+    su tasa de impuesto), debitando inventario —o gasto si no hay cuenta de
+    inventario— y acreditando la cuenta de CxP.
+    """
+    document = _get_receipt(db, receipt) if isinstance(receipt, int) else receipt
+    order = document.order
+    if order is None:
+        raise InvalidSourceDocumentError(
+            f"La recepción '{document.code}' no tiene orden de compra"
+        )
+
+    subtotal, document_tax, total = _receipt_amounts(document)
+    if total <= 0:
+        raise InvalidSourceDocumentError(
+            f"La recepción '{document.code}' no tiene un total contabilizable"
+        )
+
+    debit_id, tax_id, payable_id = _resolve_purchase_accounts(
+        db,
+        inventory_account_id=inventory_account_id,
+        expense_account_id=expense_account_id,
+        input_tax_account_id=input_tax_account_id,
+        tax_account_id=tax_account_id,
+        payable_account_id=payable_account_id,
+    )
+    tax = document_tax if tax_id is not None else Decimal("0.00")
+    debit_amount = subtotal if tax_id is not None and tax > 0 else total
+
+    items = [
+        JournalItemCreate(
+            account_id=debit_id,
+            debit=debit_amount,
+            credit=Decimal("0.00"),
+            description=f"Inventario recepción {document.code}",
+        ),
+        JournalItemCreate(
+            account_id=payable_id,
+            debit=Decimal("0.00"),
+            credit=total,
+            description=f"CxP recepción {document.code}",
+        ),
+    ]
+    if tax_id is not None and tax > 0:
+        items.append(
+            JournalItemCreate(
+                account_id=tax_id,
+                debit=tax,
+                credit=Decimal("0.00"),
+                description=f"Impuesto recepción {document.code}",
+            )
+        )
+
+    due_date = _supplier_due_date(db, order.supplier_id, document.receipt_date)
+    with _unit_of_work(db, commit=commit):
+        existing = _find_generated_entry(
+            db, reference=document.code, label=_LABEL_RECEIPT
+        )
+        if existing is not None:
+            return AccountingResult(
+                existing, _get_payable_by_reference(db, document.code)
+            )
+
+        code = _next_auto_code(db, prefix="ASI-REC", year=document.receipt_date.year)
+        entry = _build_posted_entry(
+            db,
+            code=code,
+            entry_date=document.receipt_date,
+            description=f"{_LABEL_RECEIPT} {document.code}",
+            reference_document=document.code,
+            created_by=created_by or "accounting-automation",
+            items=items,
+        )
+        balance = _upsert_payable(
+            db,
+            bill_reference=document.code,
+            supplier_id=order.supplier_id,
+            entry=entry,
+            total_amount=total,
+            due_date=due_date,
+        )
+        db.add(entry)
+    if commit:
+        db.refresh(entry)
+        db.refresh(balance)
+    return AccountingResult(entry, balance)
+
+
+def post_supplier_bill_accounting(
+    db: Session,
+    bill: int | SupplierBill,
+    *,
+    inventory_account_id: int | None = None,
+    expense_account_id: int | None = None,
+    input_tax_account_id: int | None = None,
+    tax_account_id: int | None = None,
+    payable_account_id: int | None = None,
+    created_by: str | None = None,
+    commit: bool = True,
+) -> AccountingResult:
+    """Contabiliza una factura de proveedor y su CxP en una transacción.
+
+    Usa los importes propios de la factura (``subtotal``, ``tax_amount`` y
+    ``total``) y respeta el mismo mapeo de inventario/gasto e impuestos que la
+    recepción de mercancía.
+    """
+    document = _get_bill(db, bill) if isinstance(bill, int) else bill
+    if _status_value(document.status) == "VOID":
+        raise InvalidSourceDocumentError(
+            f"La factura de proveedor '{document.code}' está anulada"
+        )
+
+    subtotal = _money(document.subtotal)
+    document_tax = _money(document.tax_amount)
+    total = _money(document.total)
+    if total <= 0:
+        raise InvalidSourceDocumentError(
+            f"La factura de proveedor '{document.code}' no tiene un total válido"
+        )
+
+    debit_id, tax_id, payable_id = _resolve_purchase_accounts(
+        db,
+        inventory_account_id=inventory_account_id,
+        expense_account_id=expense_account_id,
+        input_tax_account_id=input_tax_account_id,
+        tax_account_id=tax_account_id,
+        payable_account_id=payable_account_id,
+    )
+    tax = document_tax if tax_id is not None else Decimal("0.00")
+    debit_amount = subtotal if tax_id is not None and tax > 0 else total
+
+    items = [
+        JournalItemCreate(
+            account_id=debit_id,
+            debit=debit_amount,
+            credit=Decimal("0.00"),
+            description=f"Compra factura {document.code}",
+        ),
+        JournalItemCreate(
+            account_id=payable_id,
+            debit=Decimal("0.00"),
+            credit=total,
+            description=f"CxP factura {document.code}",
+        ),
+    ]
+    if tax_id is not None and tax > 0:
+        items.append(
+            JournalItemCreate(
+                account_id=tax_id,
+                debit=tax,
+                credit=Decimal("0.00"),
+                description=f"Impuesto factura {document.code}",
+            )
+        )
+
+    with _unit_of_work(db, commit=commit):
+        existing = _find_generated_entry(
+            db, reference=document.code, label=_LABEL_BILL
+        )
+        if existing is not None:
+            return AccountingResult(
+                existing, _get_payable_by_reference(db, document.code)
+            )
+
+        code = _next_auto_code(db, prefix="ASI-FCP", year=document.issue_date.year)
+        entry = _build_posted_entry(
+            db,
+            code=code,
+            entry_date=document.issue_date,
+            description=f"{_LABEL_BILL} {document.code}",
+            reference_document=document.code,
+            created_by=created_by or "accounting-automation",
+            items=items,
+        )
+        balance = _upsert_payable(
+            db,
+            bill_reference=document.code,
+            supplier_id=document.supplier_id,
+            entry=entry,
+            total_amount=total,
+            due_date=document.due_date,
+        )
+        db.add(entry)
+    if commit:
+        db.refresh(entry)
+        db.refresh(balance)
+    return AccountingResult(entry, balance)
+
+
+# --------------------------------------------------------------------------- #
+# Cartera: consultas y registro de cobros/pagos — reglas 5, 8 y 9
+# --------------------------------------------------------------------------- #
+
+
+def get_account_receivable(db: Session, receivable_id: int) -> AccountReceivable:
+    """Obtiene una CxC por id."""
+    return _get_document(db, AccountReceivable, receivable_id, "Cuenta por cobrar")
+
+
+def list_account_receivables(
+    db: Session,
+    *,
+    skip: int = 0,
+    limit: int = 100,
+    third_party_id: int | None = None,
+    customer_id: int | None = None,
+    status: AccountBalanceStatus | None = None,
+    due_before: date | None = None,
+    due_after: date | None = None,
+) -> list[AccountReceivable]:
+    """Lista CxC con filtros por cliente, estado y vencimiento."""
+    stmt = select(AccountReceivable)
+    party = customer_id or third_party_id
+    if party is not None:
+        stmt = stmt.where(AccountReceivable.customer_id == party)
+    if status is not None:
+        stmt = stmt.where(AccountReceivable.status == status)
+    if due_before is not None:
+        stmt = stmt.where(AccountReceivable.due_date <= due_before)
+    if due_after is not None:
+        stmt = stmt.where(AccountReceivable.due_date >= due_after)
+    stmt = stmt.order_by(AccountReceivable.id).offset(skip).limit(limit)
+    return list(db.scalars(stmt).all())
+
+
+def get_account_payable(db: Session, payable_id: int) -> AccountPayable:
+    """Obtiene una CxP por id."""
+    return _get_document(db, AccountPayable, payable_id, "Cuenta por pagar")
+
+
+def list_account_payables(
+    db: Session,
+    *,
+    skip: int = 0,
+    limit: int = 100,
+    third_party_id: int | None = None,
+    supplier_id: int | None = None,
+    status: AccountBalanceStatus | None = None,
+    due_before: date | None = None,
+    due_after: date | None = None,
+) -> list[AccountPayable]:
+    """Lista CxP con filtros por proveedor, estado y vencimiento."""
+    stmt = select(AccountPayable)
+    party = supplier_id or third_party_id
+    if party is not None:
+        stmt = stmt.where(AccountPayable.supplier_id == party)
+    if status is not None:
+        stmt = stmt.where(AccountPayable.status == status)
+    if due_before is not None:
+        stmt = stmt.where(AccountPayable.due_date <= due_before)
+    if due_after is not None:
+        stmt = stmt.where(AccountPayable.due_date >= due_after)
+    stmt = stmt.order_by(AccountPayable.id).offset(skip).limit(limit)
+    return list(db.scalars(stmt).all())
+
+
+def list_payment_records(
+    db: Session,
+    *,
+    skip: int = 0,
+    limit: int = 100,
+    receivable_id: int | None = None,
+    payable_id: int | None = None,
+    date_from: date | None = None,
+    date_to: date | None = None,
+    reference: str | None = None,
+) -> list[PaymentRecord]:
+    """Consulta el historial de cobros y pagos."""
+    stmt = select(PaymentRecord)
+    if receivable_id is not None:
+        stmt = stmt.where(PaymentRecord.receivable_id == receivable_id)
+    if payable_id is not None:
+        stmt = stmt.where(PaymentRecord.payable_id == payable_id)
+    if date_from is not None:
+        stmt = stmt.where(PaymentRecord.payment_date >= date_from)
+    if date_to is not None:
+        stmt = stmt.where(PaymentRecord.payment_date <= date_to)
+    if reference:
+        stmt = stmt.where(PaymentRecord.reference == reference)
+    stmt = stmt.order_by(PaymentRecord.id).offset(skip).limit(limit)
+    return list(db.scalars(stmt).all())
+
+
+def _resolve_payment_account(
+    db: Session,
+    *,
+    cash_account_id: int | None,
+    bank_account_id: int | None,
+    payment_account_id: int | None,
+) -> int:
+    """Cuenta de efectivo/banco que contrapartiza el cobro o pago."""
+    explicit = payment_account_id or bank_account_id or cash_account_id
+    if explicit is not None:
+        return explicit
+    cash = _resolve_account_id(db, "cash", None, required=False)
+    if cash is not None:
+        return cash
+    bank = _resolve_account_id(db, "bank", None, required=False)
+    if bank is not None:
+        return bank
+    raise AccountingError(
+        "Falta la cuenta de caja o banco para registrar el movimiento de efectivo"
+    )
+
+
+def register_receivable_payment(
+    db: Session,
+    receivable: int | PaymentCreate,
+    amount: Decimal | str | None = None,
+    *,
+    payment_date: date | None = None,
+    reference: str | None = None,
+    receivable_account_id: int | None = None,
+    cash_account_id: int | None = None,
+    bank_account_id: int | None = None,
+    payment_account_id: int | None = None,
+    created_by: str | None = None,
+    code: str | None = None,
+    commit: bool = True,
+) -> PaymentResult:
+    """Registra un cobro en una CxC con asiento ``POSTED`` y saldo actualizado.
+
+    Acepta un ``PaymentCreate`` como primer argumento o un ``receivable_id``
+    seguido del importe. Valida ``0 < amount <= total_amount - paid_amount``;
+    dentro de una sola transacción crea el asiento (debe Caja/Banco, haber CxC),
+    el ``PaymentRecord`` y actualiza ``paid_amount`` y el estado. Cualquier fallo
+    revierte los tres efectos.
+    """
+    if isinstance(receivable, PaymentCreate):
+        data = receivable
+        if data.payable_id is not None or data.receivable_id is None:
+            raise InvalidSourceDocumentError(
+                "PaymentCreate debe apuntar exactamente a una CxC"
+            )
+        target_id = data.receivable_id
+        amount = data.amount
+        payment_date = payment_date or data.payment_date
+        reference = reference or data.reference
+    else:
+        target_id = receivable
+    if amount is None:
+        raise InvalidSourceDocumentError("Se requiere el importe del cobro")
+
+    value = _money(amount)
+    if value <= 0:
+        raise InvalidSourceDocumentError("El importe del cobro debe ser mayor que cero")
+    when = payment_date or date.today()
+
+    balance = db.scalars(
+        select(AccountReceivable)
+        .where(AccountReceivable.id == target_id)
+        .with_for_update()
+    ).first()
+    if balance is None:
+        raise ResourceNotFoundError(f"Cuenta por cobrar {target_id} no encontrada")
+
+    remaining = _money(_money(balance.total_amount) - _money(balance.paid_amount))
+    if remaining <= 0:
+        raise InvalidSourceDocumentError("La cuenta por cobrar ya está liquidada")
+    if value > remaining:
+        raise InvalidSourceDocumentError(
+            f"El cobro ({value}) excede el saldo pendiente de la CxC ({remaining})"
+        )
+
+    cash_id = _resolve_payment_account(
+        db,
+        cash_account_id=cash_account_id,
+        bank_account_id=bank_account_id,
+        payment_account_id=payment_account_id,
+    )
+    receivable_id = _resolve_account_id(db, "receivable", receivable_account_id)
+    entry_code = code or _next_auto_code(db, prefix="ASI-COB", year=when.year)
+    description = f"{_LABEL_RECEIVABLE_PAYMENT} CxC-{target_id}"
+
+    with _unit_of_work(db, commit=commit):
+        entry = _build_posted_entry(
+            db,
+            code=entry_code,
+            entry_date=when,
+            description=description,
+            reference_document=reference or f"CxC-{target_id}",
+            created_by=created_by or "accounting-automation",
+            items=[
+                JournalItemCreate(
+                    account_id=cash_id,
+                    debit=value,
+                    credit=Decimal("0.00"),
+                    description=f"Cobro aplicado a CxC-{target_id}",
+                ),
+                JournalItemCreate(
+                    account_id=receivable_id,
+                    debit=Decimal("0.00"),
+                    credit=value,
+                    description=f"Abono a CxC-{target_id}",
+                ),
+            ],
+        )
+        payment = PaymentRecord(
+            receivable=balance,
+            journal_entry=entry,
+            amount=value,
+            payment_date=when,
+            reference=reference,
+        )
+        db.add(payment)
+        db.add(entry)
+        _apply_payment_to_balance(balance, value)
+    if commit:
+        db.refresh(entry)
+        db.refresh(payment)
+        db.refresh(balance)
+    return PaymentResult(entry, payment, balance)
+
+
+def register_payable_payment(
+    db: Session,
+    payable: int | PaymentCreate,
+    amount: Decimal | str | None = None,
+    *,
+    payment_date: date | None = None,
+    reference: str | None = None,
+    payable_account_id: int | None = None,
+    cash_account_id: int | None = None,
+    bank_account_id: int | None = None,
+    payment_account_id: int | None = None,
+    created_by: str | None = None,
+    code: str | None = None,
+    commit: bool = True,
+) -> PaymentResult:
+    """Registra un pago en una CxP con asiento ``POSTED`` y saldo actualizado.
+
+    Espejo de :func:`register_receivable_payment`: debe a la cuenta de CxP y
+    haber a Caja/Banco, con validación de saldo y transacción atómica.
+    """
+    if isinstance(payable, PaymentCreate):
+        data = payable
+        if data.receivable_id is not None or data.payable_id is None:
+            raise InvalidSourceDocumentError(
+                "PaymentCreate debe apuntar exactamente a una CxP"
+            )
+        target_id = data.payable_id
+        amount = data.amount
+        payment_date = payment_date or data.payment_date
+        reference = reference or data.reference
+    else:
+        target_id = payable
+    if amount is None:
+        raise InvalidSourceDocumentError("Se requiere el importe del pago")
+
+    value = _money(amount)
+    if value <= 0:
+        raise InvalidSourceDocumentError("El importe del pago debe ser mayor que cero")
+    when = payment_date or date.today()
+
+    balance = db.scalars(
+        select(AccountPayable)
+        .where(AccountPayable.id == target_id)
+        .with_for_update()
+    ).first()
+    if balance is None:
+        raise ResourceNotFoundError(f"Cuenta por pagar {target_id} no encontrada")
+
+    remaining = _money(_money(balance.total_amount) - _money(balance.paid_amount))
+    if remaining <= 0:
+        raise InvalidSourceDocumentError("La cuenta por pagar ya está liquidada")
+    if value > remaining:
+        raise InvalidSourceDocumentError(
+            f"El pago ({value}) excede el saldo pendiente de la CxP ({remaining})"
+        )
+
+    cash_id = _resolve_payment_account(
+        db,
+        cash_account_id=cash_account_id,
+        bank_account_id=bank_account_id,
+        payment_account_id=payment_account_id,
+    )
+    payable_id = _resolve_account_id(db, "payable", payable_account_id)
+    entry_code = code or _next_auto_code(db, prefix="ASI-PAG", year=when.year)
+    description = f"{_LABEL_PAYABLE_PAYMENT} CxP-{target_id}"
+
+    with _unit_of_work(db, commit=commit):
+        entry = _build_posted_entry(
+            db,
+            code=entry_code,
+            entry_date=when,
+            description=description,
+            reference_document=reference or f"CxP-{target_id}",
+            created_by=created_by or "accounting-automation",
+            items=[
+                JournalItemCreate(
+                    account_id=payable_id,
+                    debit=value,
+                    credit=Decimal("0.00"),
+                    description=f"Cancelación parcial CxP-{target_id}",
+                ),
+                JournalItemCreate(
+                    account_id=cash_id,
+                    debit=Decimal("0.00"),
+                    credit=value,
+                    description=f"Salida de caja por CxP-{target_id}",
+                ),
+            ],
+        )
+        payment = PaymentRecord(
+            payable=balance,
+            journal_entry=entry,
+            amount=value,
+            payment_date=when,
+            reference=reference,
+        )
+        db.add(payment)
+        db.add(entry)
+        _apply_payment_to_balance(balance, value)
+    if commit:
+        db.refresh(entry)
+        db.refresh(payment)
+        db.refresh(balance)
+    return PaymentResult(entry, payment, balance)
 
 
 # --------------------------------------------------------------------------- #
